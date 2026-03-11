@@ -855,28 +855,40 @@ waitLoop:
 
 // AbortSession sends an abort control command to a running agent,
 // terminating the active Claude query without stopping the container.
-func (o *Orchestrator) AbortSession(ctx context.Context, agentID string) error {
-	// Drain pending messages so they don't run after the abort
-	if q := o.getQueue(agentID); q != nil {
-		q.Clear()
+// If chatID is non-zero, only the specified chat's query is aborted.
+func (o *Orchestrator) AbortSession(ctx context.Context, agentID string, chatID int64) error {
+	if chatID == 0 {
+		// Global abort — drain pending messages
+		if q := o.getQueue(agentID); q != nil {
+			q.Clear()
+		}
 	}
 	if o.containers.GetRunning(agentID) == nil {
 		return nil
 	}
 	topic := natsbus.TopicAgentControl(agentID)
-	data, _ := json.Marshal(map[string]string{"command": "abort"})
+	cmd := map[string]string{"command": "abort"}
+	if chatID != 0 {
+		cmd["chat_id"] = strconv.FormatInt(chatID, 10)
+	}
+	data, _ := json.Marshal(cmd)
 	_, err := o.client.Request(topic, data, 5*time.Second)
 	return err
 }
 
 // ClearSession sends a clear_session control command to a running agent,
 // resetting its conversation context without stopping the container.
-func (o *Orchestrator) ClearSession(ctx context.Context, agentID string) error {
+// If chatID is non-zero, only the specified chat's session is cleared.
+func (o *Orchestrator) ClearSession(ctx context.Context, agentID string, chatID int64) error {
 	if o.containers.GetRunning(agentID) == nil {
 		return nil
 	}
 	topic := natsbus.TopicAgentControl(agentID)
-	data, _ := json.Marshal(map[string]string{"command": "clear_session"})
+	cmd := map[string]string{"command": "clear_session"}
+	if chatID != 0 {
+		cmd["chat_id"] = strconv.FormatInt(chatID, 10)
+	}
+	data, _ := json.Marshal(cmd)
 	_, err := o.client.Request(topic, data, 5*time.Second)
 	return err
 }

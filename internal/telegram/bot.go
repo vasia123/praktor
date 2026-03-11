@@ -777,7 +777,7 @@ func (b *Bot) cmdStop(ctx context.Context, chatID int64, payload string) {
 		_ = b.SendMessage(ctx, chatID, "Usage: /stop [agent]")
 		return
 	}
-	if err := b.orch.AbortSession(ctx, agentID); err != nil {
+	if err := b.orch.AbortSession(ctx, agentID, chatID); err != nil {
 		_ = b.SendMessage(ctx, chatID, fmt.Sprintf("Failed to stop *%s*: %s", agentID, err))
 		return
 	}
@@ -790,7 +790,7 @@ func (b *Bot) cmdReset(ctx context.Context, chatID int64, payload string) {
 		_ = b.SendMessage(ctx, chatID, "Usage: /reset [agent]")
 		return
 	}
-	if err := b.orch.ClearSession(ctx, agentID); err != nil {
+	if err := b.orch.ClearSession(ctx, agentID, chatID); err != nil {
 		_ = b.SendMessage(ctx, chatID, fmt.Sprintf("Failed to clear session for *%s*: %s", agentID, err))
 		return
 	}

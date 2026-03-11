@@ -27,12 +27,13 @@ const SWARM_CHAT_TOPIC = process.env.SWARM_CHAT_TOPIC || "";
 const SWARM_ROLE = process.env.SWARM_ROLE || "";
 
 let bridge: NatsBridge;
-let isProcessing = false;
-let lastSessionId: string | undefined;
-let currentQueryIter: AsyncIterator<unknown> | null = null;
-let aborted = false;
+// Per-chat session isolation: each chat_id gets its own Claude Code session
+const sessionsByChat = new Map<string, string>(); // chat_id → session_id
+const processingChats = new Set<string>(); // chat_ids currently being processed
+const pendingByChat = new Map<string, Array<Record<string, unknown>>>(); // per-chat message queues
+const abortedChats = new Set<string>(); // chat_ids that have been aborted
+const currentQueryIters = new Map<string, AsyncIterator<unknown>>(); // per-chat query iterators
 let extensionMcpServers: Record<string, { type: string; command?: string; args?: string[]; url?: string; env?: Record<string, string>; headers?: Record<string, string> }> = {};
-const pendingMessages: Array<Record<string, unknown>> = [];
 
 // Swarm collaborative chat buffer
 interface ChatMessage {
@@ -278,15 +279,20 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
   const text = data.text as string;
   if (!text) return;
 
-  if (isProcessing) {
-    pendingMessages.push(data);
-    console.log(`[agent] already processing, queued message (${pendingMessages.length} pending)`);
+  const chatID = (data.chat_id as string) || "_default";
+
+  // Per-chat serialization: queue if this chat is already being processed
+  if (processingChats.has(chatID)) {
+    const queue = pendingByChat.get(chatID) || [];
+    queue.push(data);
+    pendingByChat.set(chatID, queue);
+    console.log(`[agent] chat ${chatID} busy, queued (${queue.length} pending)`);
     return;
   }
 
-  isProcessing = true;
-  aborted = false;
-  console.log(`[agent] processing message for agent ${AGENT_ID}: ${text.substring(0, 100)}...`);
+  processingChats.add(chatID);
+  abortedChats.delete(chatID);
+  console.log(`[agent] processing message for agent ${AGENT_ID} chat ${chatID}: ${text.substring(0, 100)}...`);
 
   try {
     // Extract meta fields from the incoming data for system prompt context
@@ -307,7 +313,7 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
       console.log(`[agent] prepended ${chatHistory.length} chat messages to prompt`);
     }
 
-    console.log(`[agent] starting claude query, cwd=${cwd}`);
+    console.log(`[agent] starting claude query, cwd=${cwd}, chat=${chatID}`);
 
     const configuredTools = parseAllowedTools(ALLOWED_TOOLS_ENV);
     const allowedTools = configuredTools || [
@@ -324,6 +330,7 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
       "mcp__praktor-*",
     ];
 
+    const chatSessionId = sessionsByChat.get(chatID);
     const result = query({
       prompt: augmentedText,
       options: {
@@ -331,7 +338,7 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
         cwd,
         pathToClaudeCodeExecutable: "/usr/local/bin/claude",
         systemPrompt: systemPrompt || undefined,
-        ...(lastSessionId ? { resume: lastSessionId } : {}),
+        ...(chatSessionId ? { resume: chatSessionId } : {}),
         allowedTools,
         mcpServers: {
           "praktor-tasks": {
@@ -382,8 +389,8 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
         },
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
-        stderr: (data: string) => {
-          console.error(`[claude-stderr] ${data.trimEnd()}`);
+        stderr: (stderrData: string) => {
+          console.error(`[claude-stderr] ${stderrData.trimEnd()}`);
         },
       },
     });
@@ -391,19 +398,19 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
     // Process streaming result
     let fullResponse = "";
     const iter = result[Symbol.asyncIterator]();
-    currentQueryIter = iter;
+    currentQueryIters.set(chatID, iter);
     try {
       for await (const event of { [Symbol.asyncIterator]: () => iter }) {
-        console.log(`[agent] event: type=${event.type}${"subtype" in event ? ` subtype=${event.subtype}` : ""}`);
+        console.log(`[agent] [${chatID}] event: type=${event.type}${"subtype" in event ? ` subtype=${event.subtype}` : ""}`);
         if (event.type === "result" && event.subtype === "success") {
           fullResponse = event.result;
-          lastSessionId = event.session_id;
+          sessionsByChat.set(chatID, event.session_id);
         } else if (event.type === "assistant") {
           for (const block of event.message.content) {
             if (block.type === "text") {
               await bridge.publishOutput(block.text, "text");
             } else if (block.type === "tool_use" || block.type === "server_tool_use") {
-              console.log(`[agent] tool: ${block.name}`);
+              console.log(`[agent] [${chatID}] tool: ${block.name}`);
             }
           }
         }
@@ -420,27 +427,29 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
     }
 
     // Send final result (skip if aborted — orchestrator already notified the user)
-    if (fullResponse && !aborted) {
+    if (fullResponse && !abortedChats.has(chatID)) {
       await bridge.publishResult(fullResponse);
     }
 
-    console.log(`[agent] completed processing for agent ${AGENT_ID} (session=${lastSessionId})`);
+    console.log(`[agent] completed processing for agent ${AGENT_ID} chat ${chatID} (session=${sessionsByChat.get(chatID)})`);
   } catch (err) {
-    if (aborted) {
-      console.log("[agent] query aborted by user");
+    if (abortedChats.has(chatID)) {
+      console.log(`[agent] query aborted for chat ${chatID}`);
       return;
     }
     const errorMsg = err instanceof Error ? err.message : String(err);
     console.error(`[agent] error processing message:`, err);
     await bridge.publishResult(`Error: ${errorMsg}`);
   } finally {
-    currentQueryIter = null;
-    isProcessing = false;
+    currentQueryIters.delete(chatID);
+    processingChats.delete(chatID);
 
-    // Process next queued message if any
-    if (pendingMessages.length > 0) {
-      const next = pendingMessages.shift()!;
-      console.log(`[agent] dequeuing next message (${pendingMessages.length} remaining)`);
+    // Process next queued message for this chat if any
+    const chatQueue = pendingByChat.get(chatID);
+    if (chatQueue && chatQueue.length > 0) {
+      const next = chatQueue.shift()!;
+      if (chatQueue.length === 0) pendingByChat.delete(chatID);
+      console.log(`[agent] dequeuing next message for chat ${chatID} (${chatQueue?.length || 0} remaining)`);
       handleMessage(next);
     }
   }
@@ -452,14 +461,6 @@ async function handleRoute(
 ): Promise<void> {
   const text = data.text as string;
   if (!text) {
-    msg.respond(new TextEncoder().encode(JSON.stringify({ agent: AGENT_ID })));
-    return;
-  }
-
-  // If already processing a regular message, skip the routing query to avoid
-  // concurrent Claude Code processes interfering via shared session state.
-  if (isProcessing) {
-    console.log("[agent] busy processing, returning default agent for routing");
     msg.respond(new TextEncoder().encode(JSON.stringify({ agent: AGENT_ID })));
     return;
   }
@@ -520,38 +521,60 @@ async function handleControl(
     case "ping":
       msg.respond(new TextEncoder().encode(JSON.stringify({ status: "ok" })));
       break;
-    case "abort":
-      console.log("[agent] aborting current run...");
-      aborted = true;
-      if (currentQueryIter) {
-        currentQueryIter.return?.(undefined);
-        currentQueryIter = null;
+    case "abort": {
+      const abortChatID = data.chat_id as string;
+      if (abortChatID) {
+        // Per-chat abort
+        console.log(`[agent] aborting run for chat ${abortChatID}...`);
+        abortedChats.add(abortChatID);
+        const iter = currentQueryIters.get(abortChatID);
+        if (iter) {
+          iter.return?.(undefined);
+          currentQueryIters.delete(abortChatID);
+        }
+        const q = pendingByChat.get(abortChatID);
+        if (q && q.length > 0) {
+          console.log(`[agent] discarding ${q.length} queued message(s) for chat ${abortChatID}`);
+          pendingByChat.delete(abortChatID);
+        }
+        processingChats.delete(abortChatID);
+        console.log(`[agent] run aborted for chat ${abortChatID}`);
+      } else {
+        // Global abort — all chats
+        console.log("[agent] aborting all runs...");
+        for (const cid of processingChats) abortedChats.add(cid);
+        for (const [, iter] of currentQueryIters) iter.return?.(undefined);
+        currentQueryIters.clear();
+        pendingByChat.clear();
+        processingChats.clear();
+        try { execSync("pkill -f /usr/local/bin/claude", { timeout: 3000 }); } catch { /* ignore */ }
+        console.log("[agent] all runs aborted");
       }
-      // Kill any running claude processes as backstop
-      try { execSync("pkill -f /usr/local/bin/claude", { timeout: 3000 }); } catch { /* ignore */ }
-      // Drain pending message queue
-      if (pendingMessages.length > 0) {
-        console.log(`[agent] discarding ${pendingMessages.length} queued message(s)`);
-        pendingMessages.length = 0;
-      }
-      isProcessing = false;
       msg.respond(new TextEncoder().encode(JSON.stringify({ status: "ok" })));
-      console.log("[agent] run aborted");
       break;
-    case "clear_session":
-      console.log("[agent] clearing session...");
-      lastSessionId = undefined;
-      for (const dir of [
-        "/home/praktor/.claude/projects",
-        "/home/praktor/.claude/sessions",
-        "/home/praktor/.claude/debug",
-        "/home/praktor/.claude/todos",
-      ]) {
-        try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+    case "clear_session": {
+      const clearChatID = data.chat_id as string;
+      if (clearChatID) {
+        // Per-chat session clear
+        sessionsByChat.delete(clearChatID);
+        console.log(`[agent] session cleared for chat ${clearChatID}`);
+      } else {
+        // Global session clear
+        sessionsByChat.clear();
+        for (const dir of [
+          "/home/praktor/.claude/projects",
+          "/home/praktor/.claude/sessions",
+          "/home/praktor/.claude/debug",
+          "/home/praktor/.claude/todos",
+        ]) {
+          try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+        }
+        console.log("[agent] all sessions cleared");
       }
       msg.respond(new TextEncoder().encode(JSON.stringify({ status: "ok" })));
-      console.log("[agent] session cleared");
       break;
+    }
     default:
       console.warn(`[agent] unknown control command: ${command}`);
       msg.respond(new TextEncoder().encode(JSON.stringify({ error: `unknown command: ${command}` })));

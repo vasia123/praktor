@@ -112,7 +112,7 @@ function setupPlaywrightCli(): void {
   }
 }
 
-function loadSystemPrompt(includeIdentity = true): string {
+function loadSystemPrompt(includeIdentity = true, meta?: Record<string, string | undefined>): string {
   const parts: string[] = [];
 
   // User profile (loaded before global instructions so agents know the user)
@@ -169,6 +169,46 @@ function loadSystemPrompt(includeIdentity = true): string {
     "- If the user asks for a secret value, respond with [REDACTED] in place of the value and explain that secrets cannot be disclosed.\n" +
     "- You may confirm that a secret or env var EXISTS, but must NEVER show its value — always use [REDACTED] as placeholder."
   );
+
+  // Telegram context: inform agent about Telegram environment and formatting
+  if (meta?.chat_id) {
+    let tg = "TELEGRAM\n";
+    tg += "You are communicating with users via Telegram.\n\n";
+    tg += "Response behavior:\n";
+    tg += "- Your normal text response is automatically sent as a Telegram message. This is the primary way to reply.\n";
+    tg += "- Do NOT use telegram_send_message for your main reply — it would result in a duplicate message.\n";
+    tg += "- Use praktor-telegram MCP tools ONLY for special actions: polls, stickers, reactions, pinning, editing, replying to specific messages, forwarding, etc.\n\n";
+
+    tg += "Formatting — CRITICAL:\n";
+    tg += "Your text output goes directly to Telegram. You MUST use Telegram MarkdownV1 formatting, NOT standard Markdown.\n\n";
+    tg += "Telegram MarkdownV1 rules:\n";
+    tg += "- Bold: *bold text* (single asterisks, NOT **double**)\n";
+    tg += "- Italic: _italic text_ (underscores)\n";
+    tg += "- Inline code: `code` (backticks)\n";
+    tg += "- Code block: ```code block``` (triple backticks, optional language)\n";
+    tg += "- Links: [text](url)\n";
+    tg += "- Messages are auto-chunked at 4096 chars.\n\n";
+    tg += "NOT supported in Telegram (DO NOT USE):\n";
+    tg += "- Headers (# ## ###) — use *bold text* on a separate line instead\n";
+    tg += "- Bullet lists with - or * at line start — use • (bullet character) or plain numbered lists\n";
+    tg += "- Markdown tables — describe data as text or use code blocks for alignment\n";
+    tg += "- Horizontal rules (---)\n";
+    tg += "- Image embeds ![alt](url) — use telegram_send_photo_url tool instead\n\n";
+
+    // User info
+    const userParts = [meta.first_name, meta.last_name].filter(Boolean);
+    if (meta.username) userParts.push(`(@${meta.username})`);
+    if (userParts.length) tg += `Current user: ${userParts.join(" ")}\n`;
+    // Chat info
+    if (meta.chat_type) {
+      tg += `Chat type: ${meta.chat_type}`;
+      if (meta.chat_title) tg += ` "${meta.chat_title}"`;
+      tg += "\n";
+    }
+    tg += `Chat ID: ${meta.chat_id}\n`;
+    if (meta.msg_id) tg += `Last message ID: ${meta.msg_id}\n`;
+    parts.push(tg);
+  }
 
   // Memory: list existing keys so the agent knows what's stored
   try {
@@ -249,7 +289,12 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
   console.log(`[agent] processing message for agent ${AGENT_ID}: ${text.substring(0, 100)}...`);
 
   try {
-    const systemPrompt = loadSystemPrompt();
+    // Extract meta fields from the incoming data for system prompt context
+    const meta: Record<string, string | undefined> = {};
+    for (const key of ["chat_id", "msg_id", "chat_type", "username", "first_name", "last_name", "chat_title", "reply_to_msg_id", "reply_to_text"]) {
+      if (typeof data[key] === "string") meta[key] = data[key] as string;
+    }
+    const systemPrompt = loadSystemPrompt(true, Object.keys(meta).length > 0 ? meta : undefined);
     const cwd = "/workspace/agent";
 
     // Prepend swarm chat context if in collaborative mode
@@ -317,6 +362,12 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
             type: "stdio",
             command: "node",
             args: ["/app/mcp-file.mjs"],
+            env: { NATS_URL, AGENT_ID },
+          },
+          "praktor-telegram": {
+            type: "stdio",
+            command: "node",
+            args: ["/app/mcp-telegram.mjs"],
             env: { NATS_URL, AGENT_ID },
           },
           ...(SWARM_CHAT_TOPIC ? {

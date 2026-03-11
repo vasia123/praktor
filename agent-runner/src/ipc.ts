@@ -10,6 +10,8 @@ export interface IPCResponse {
   error?: string;
   id?: string;
   content?: string;
+  message_id?: number;
+  data?: Record<string, unknown>;
   tasks?: Array<{
     id: string;
     name: string;

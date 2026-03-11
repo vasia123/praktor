@@ -41,14 +41,32 @@ type Orchestrator struct {
 	queues     map[string]*AgentQueue
 	lastMeta   map[string]map[string]string // agentID → last message meta
 	mu         sync.RWMutex
-	listeners     []OutputListener
-	fileListeners []FileListener
-	listenerMu    sync.RWMutex
+	listeners        []OutputListener
+	fileListeners    []FileListener
+	telegramHandler  TelegramActionHandler
+	listenerMu       sync.RWMutex
 	swarmCoord SwarmCoordinator
 }
 
 type OutputListener func(agentID, content string, meta map[string]string)
 type FileListener func(agentID string, chatID int64, data []byte, name, mimeType, caption string)
+
+// TelegramAction represents a Telegram API action requested by an agent via IPC.
+type TelegramAction struct {
+	Type    string          `json:"type"`
+	ChatID  int64           `json:"chat_id"`
+	Payload json.RawMessage `json:"payload"`
+}
+
+// TelegramActionResult is the response from executing a Telegram action.
+type TelegramActionResult struct {
+	MessageID int             `json:"message_id,omitempty"`
+	Data      json.RawMessage `json:"data,omitempty"`
+	Error     string          `json:"error,omitempty"`
+}
+
+// TelegramActionHandler processes Telegram actions on behalf of agents.
+type TelegramActionHandler func(ctx context.Context, action TelegramAction) TelegramActionResult
 
 type IPCCommand struct {
 	Type    string          `json:"type"`
@@ -91,6 +109,23 @@ func NewOrchestrator(bus *natsbus.Bus, ctr *container.Manager, s *store.Store, r
 // SetSwarmCoordinator sets the swarm coordinator for handling swarm IPC commands.
 func (o *Orchestrator) SetSwarmCoordinator(sc SwarmCoordinator) {
 	o.swarmCoord = sc
+}
+
+// OnTelegramAction registers the handler for Telegram actions from agents.
+func (o *Orchestrator) OnTelegramAction(handler TelegramActionHandler) {
+	o.telegramHandler = handler
+}
+
+// resolveChatID returns the chat ID from the payload string, falling back to the agent's last known chat.
+func (o *Orchestrator) resolveChatID(agentID, chatIDStr string) (int64, error) {
+	if chatIDStr != "" {
+		return strconv.ParseInt(chatIDStr, 10, 64)
+	}
+	meta := o.getLastMeta(agentID)
+	if meta != nil && meta["chat_id"] != "" {
+		return strconv.ParseInt(meta["chat_id"], 10, 64)
+	}
+	return 0, fmt.Errorf("no chat_id available for agent %s", agentID)
 }
 
 // UpdateDefaults replaces the defaults config used for new containers.
@@ -447,6 +482,12 @@ func (o *Orchestrator) handleIPC(msg *nats.Msg) {
 		o.ipcExtensionStatus(msg, agentID, cmd.Payload)
 	case "send_file":
 		o.ipcSendFile(msg, agentID, cmd.Payload)
+	case "tg_send_message", "tg_reply", "tg_edit_message", "tg_delete_message",
+		"tg_forward_message", "tg_send_photo_url", "tg_send_sticker",
+		"tg_send_voice", "tg_send_video_note", "tg_send_animation",
+		"tg_send_poll", "tg_set_reaction", "tg_pin_message", "tg_unpin_message",
+		"tg_get_chat_info":
+		o.ipcTelegramAction(msg, agentID, cmd.Type, cmd.Payload)
 	default:
 		slog.Warn("unknown IPC command", "type", cmd.Type)
 		o.respondIPC(msg, map[string]any{"error": "unknown command: " + cmd.Type})
@@ -982,4 +1023,46 @@ func (o *Orchestrator) WriteVolumeBytes(ctx context.Context, workspace, filePath
 
 func (o *Orchestrator) ExecInAgent(ctx context.Context, agentID string, cmd []string) (string, error) {
 	return o.containers.Exec(ctx, agentID, cmd)
+}
+
+func (o *Orchestrator) ipcTelegramAction(msg *nats.Msg, agentID, ipcType string, payload json.RawMessage) {
+	if o.telegramHandler == nil {
+		o.respondIPC(msg, map[string]any{"error": "telegram handler not available"})
+		return
+	}
+
+	// Parse chat_id from payload; fall back to agent's last known chat
+	var generic struct {
+		ChatID string `json:"chat_id"`
+	}
+	_ = json.Unmarshal(payload, &generic)
+
+	chatID, err := o.resolveChatID(agentID, generic.ChatID)
+	if err != nil {
+		o.respondIPC(msg, map[string]any{"error": err.Error()})
+		return
+	}
+
+	// Strip "tg_" prefix for action type
+	actionType := strings.TrimPrefix(ipcType, "tg_")
+
+	result := o.telegramHandler(context.Background(), TelegramAction{
+		Type:    actionType,
+		ChatID:  chatID,
+		Payload: payload,
+	})
+
+	if result.Error != "" {
+		o.respondIPC(msg, map[string]any{"error": result.Error})
+		return
+	}
+
+	resp := map[string]any{"ok": true}
+	if result.MessageID != 0 {
+		resp["message_id"] = result.MessageID
+	}
+	if result.Data != nil {
+		resp["data"] = json.RawMessage(result.Data)
+	}
+	o.respondIPC(msg, resp)
 }

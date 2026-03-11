@@ -10,6 +10,7 @@ const entries = [
   ["src/mcp-swarm.ts", "out/mcp-swarm.mjs"],
   ["src/mcp-nix.ts", "out/mcp-nix.mjs"],
   ["src/mcp-file.ts", "out/mcp-file.mjs"],
+  ["src/mcp-telegram.ts", "out/mcp-telegram.mjs"],
 ];
 
 for (const [entryPoint, outfile] of entries) {

@@ -3,6 +3,7 @@ package telegram
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -133,6 +134,11 @@ func NewBot(cfg config.TelegramConfig, orch *agent.Orchestrator, rtr *router.Rou
 				slog.Error("failed to send document", "chat", chatID, "name", name, "error", err)
 			}
 		}
+	})
+
+	// Register Telegram action handler for agent IPC
+	orch.OnTelegramAction(func(ctx context.Context, action agent.TelegramAction) agent.TelegramActionResult {
+		return b.handleTelegramAction(ctx, action)
 	})
 
 	// Subscribe to swarm events for result delivery
@@ -345,8 +351,34 @@ func (b *Bot) handleMessage(ctx context.Context, msg telego.Message) {
 	}
 
 	meta := map[string]string{
-		"sender":  fmt.Sprintf("user:%s", senderID),
-		"chat_id": chatIDStr,
+		"sender":    fmt.Sprintf("user:%s", senderID),
+		"chat_id":   chatIDStr,
+		"msg_id":    strconv.Itoa(msg.MessageID),
+		"chat_type": string(msg.Chat.Type),
+	}
+	if msg.From != nil {
+		if msg.From.Username != "" {
+			meta["username"] = msg.From.Username
+		}
+		if msg.From.FirstName != "" {
+			meta["first_name"] = msg.From.FirstName
+		}
+		if msg.From.LastName != "" {
+			meta["last_name"] = msg.From.LastName
+		}
+	}
+	if msg.Chat.Title != "" {
+		meta["chat_title"] = msg.Chat.Title
+	}
+	if msg.ReplyToMessage != nil {
+		meta["reply_to_msg_id"] = strconv.Itoa(msg.ReplyToMessage.MessageID)
+		replyText := msg.ReplyToMessage.Text
+		if len(replyText) > 200 {
+			replyText = replyText[:200] + "..."
+		}
+		if replyText != "" {
+			meta["reply_to_text"] = replyText
+		}
 	}
 
 	if err := b.orch.HandleMessage(ctx, agentID, cleanedMessage, meta); err != nil {
@@ -714,8 +746,24 @@ func (b *Bot) cmdStart(ctx context.Context, msg telego.Message, payload string) 
 	_ = b.sendChatAction(ctx, chatID, "typing")
 
 	meta := map[string]string{
-		"sender":  fmt.Sprintf("user:%d", msg.From.ID),
-		"chat_id": strconv.FormatInt(chatID, 10),
+		"sender":    fmt.Sprintf("user:%d", msg.From.ID),
+		"chat_id":   strconv.FormatInt(chatID, 10),
+		"msg_id":    strconv.Itoa(msg.MessageID),
+		"chat_type": string(msg.Chat.Type),
+	}
+	if msg.From != nil {
+		if msg.From.Username != "" {
+			meta["username"] = msg.From.Username
+		}
+		if msg.From.FirstName != "" {
+			meta["first_name"] = msg.From.FirstName
+		}
+		if msg.From.LastName != "" {
+			meta["last_name"] = msg.From.LastName
+		}
+	}
+	if msg.Chat.Title != "" {
+		meta["chat_title"] = msg.Chat.Title
 	}
 	if err := b.orch.HandleMessage(ctx, agentID, "Hello!", meta); err != nil {
 		slog.Error("handle start failed", "agent", agentID, "error", err)
@@ -1044,3 +1092,412 @@ func (b *Bot) handleSwarmEvent(msg *nats.Msg) {
 		_ = b.SendMessage(ctx, chatID, sb.String())
 	}
 }
+
+// handleTelegramAction dispatches a Telegram action from an agent to the appropriate bot API call.
+func (b *Bot) handleTelegramAction(ctx context.Context, action agent.TelegramAction) agent.TelegramActionResult {
+	chatID := tu.ID(action.ChatID)
+
+	switch action.Type {
+	case "send_message":
+		var p struct {
+			Text      string `json:"text"`
+			ParseMode string `json:"parse_mode"`
+		}
+		if err := json.Unmarshal(action.Payload, &p); err != nil {
+			return agent.TelegramActionResult{Error: "invalid payload: " + err.Error()}
+		}
+		if p.Text == "" {
+			return agent.TelegramActionResult{Error: "text is required"}
+		}
+		ids, err := b.sendMessage(ctx, action.ChatID, p.Text)
+		if err != nil {
+			return agent.TelegramActionResult{Error: err.Error()}
+		}
+		if len(ids) > 0 {
+			return agent.TelegramActionResult{MessageID: ids[0]}
+		}
+		return agent.TelegramActionResult{}
+
+	case "reply":
+		var p struct {
+			Text      string `json:"text"`
+			MessageID int    `json:"message_id"`
+		}
+		if err := json.Unmarshal(action.Payload, &p); err != nil {
+			return agent.TelegramActionResult{Error: "invalid payload: " + err.Error()}
+		}
+		if p.Text == "" || p.MessageID == 0 {
+			return agent.TelegramActionResult{Error: "text and message_id are required"}
+		}
+		text := toTelegramMarkdown(p.Text)
+		msg := tu.Message(chatID, text)
+		msg.ParseMode = telego.ModeMarkdown
+		msg.ReplyParameters = &telego.ReplyParameters{MessageID: p.MessageID}
+		sent, err := b.bot.SendMessage(ctx, msg)
+		if err != nil {
+			// Retry without markdown
+			msg.ParseMode = ""
+			sent, err = b.bot.SendMessage(ctx, msg)
+		}
+		if err != nil {
+			return agent.TelegramActionResult{Error: err.Error()}
+		}
+		if sent != nil {
+			return agent.TelegramActionResult{MessageID: sent.MessageID}
+		}
+		return agent.TelegramActionResult{}
+
+	case "edit_message":
+		var p struct {
+			MessageID int    `json:"message_id"`
+			Text      string `json:"text"`
+		}
+		if err := json.Unmarshal(action.Payload, &p); err != nil {
+			return agent.TelegramActionResult{Error: "invalid payload: " + err.Error()}
+		}
+		if p.MessageID == 0 || p.Text == "" {
+			return agent.TelegramActionResult{Error: "message_id and text are required"}
+		}
+		text := toTelegramMarkdown(p.Text)
+		sent, err := b.bot.EditMessageText(ctx, &telego.EditMessageTextParams{
+			ChatID:    chatID,
+			MessageID: p.MessageID,
+			Text:      text,
+			ParseMode: telego.ModeMarkdown,
+		})
+		if err != nil {
+			// Retry without markdown
+			sent, err = b.bot.EditMessageText(ctx, &telego.EditMessageTextParams{
+				ChatID:    chatID,
+				MessageID: p.MessageID,
+				Text:      text,
+			})
+		}
+		if err != nil {
+			return agent.TelegramActionResult{Error: err.Error()}
+		}
+		if sent != nil {
+			return agent.TelegramActionResult{MessageID: sent.MessageID}
+		}
+		return agent.TelegramActionResult{}
+
+	case "delete_message":
+		var p struct {
+			MessageID int `json:"message_id"`
+		}
+		if err := json.Unmarshal(action.Payload, &p); err != nil {
+			return agent.TelegramActionResult{Error: "invalid payload: " + err.Error()}
+		}
+		if p.MessageID == 0 {
+			return agent.TelegramActionResult{Error: "message_id is required"}
+		}
+		if err := b.bot.DeleteMessage(ctx, &telego.DeleteMessageParams{
+			ChatID:    chatID,
+			MessageID: p.MessageID,
+		}); err != nil {
+			return agent.TelegramActionResult{Error: err.Error()}
+		}
+		return agent.TelegramActionResult{}
+
+	case "forward_message":
+		var p struct {
+			FromChatID int64 `json:"from_chat_id"`
+			MessageID  int   `json:"message_id"`
+			ToChatID   int64 `json:"to_chat_id"`
+		}
+		if err := json.Unmarshal(action.Payload, &p); err != nil {
+			return agent.TelegramActionResult{Error: "invalid payload: " + err.Error()}
+		}
+		if p.MessageID == 0 {
+			return agent.TelegramActionResult{Error: "message_id is required"}
+		}
+		fromChat := chatID
+		if p.FromChatID != 0 {
+			fromChat = tu.ID(p.FromChatID)
+		}
+		toChat := chatID
+		if p.ToChatID != 0 {
+			toChat = tu.ID(p.ToChatID)
+		}
+		sent, err := b.bot.ForwardMessage(ctx, &telego.ForwardMessageParams{
+			ChatID:     toChat,
+			FromChatID: fromChat,
+			MessageID:  p.MessageID,
+		})
+		if err != nil {
+			return agent.TelegramActionResult{Error: err.Error()}
+		}
+		if sent != nil {
+			return agent.TelegramActionResult{MessageID: sent.MessageID}
+		}
+		return agent.TelegramActionResult{}
+
+	case "send_photo_url":
+		var p struct {
+			URL     string `json:"url"`
+			Caption string `json:"caption"`
+		}
+		if err := json.Unmarshal(action.Payload, &p); err != nil {
+			return agent.TelegramActionResult{Error: "invalid payload: " + err.Error()}
+		}
+		if p.URL == "" {
+			return agent.TelegramActionResult{Error: "url is required"}
+		}
+		params := &telego.SendPhotoParams{
+			ChatID: chatID,
+			Photo:  telego.InputFile{URL: p.URL},
+		}
+		if p.Caption != "" {
+			params.Caption = p.Caption
+		}
+		sent, err := b.bot.SendPhoto(ctx, params)
+		if err != nil {
+			return agent.TelegramActionResult{Error: err.Error()}
+		}
+		if sent != nil {
+			return agent.TelegramActionResult{MessageID: sent.MessageID}
+		}
+		return agent.TelegramActionResult{}
+
+	case "send_sticker":
+		var p struct {
+			Sticker string `json:"sticker"`
+		}
+		if err := json.Unmarshal(action.Payload, &p); err != nil {
+			return agent.TelegramActionResult{Error: "invalid payload: " + err.Error()}
+		}
+		if p.Sticker == "" {
+			return agent.TelegramActionResult{Error: "sticker is required"}
+		}
+		// Sticker can be a file_id or URL
+		input := telego.InputFile{FileID: p.Sticker}
+		if strings.HasPrefix(p.Sticker, "http") {
+			input = telego.InputFile{URL: p.Sticker}
+		}
+		sent, err := b.bot.SendSticker(ctx, &telego.SendStickerParams{
+			ChatID:  chatID,
+			Sticker: input,
+		})
+		if err != nil {
+			return agent.TelegramActionResult{Error: err.Error()}
+		}
+		if sent != nil {
+			return agent.TelegramActionResult{MessageID: sent.MessageID}
+		}
+		return agent.TelegramActionResult{}
+
+	case "send_voice":
+		var p struct {
+			Data    string `json:"data"`
+			Caption string `json:"caption"`
+		}
+		if err := json.Unmarshal(action.Payload, &p); err != nil {
+			return agent.TelegramActionResult{Error: "invalid payload: " + err.Error()}
+		}
+		if p.Data == "" {
+			return agent.TelegramActionResult{Error: "data (base64) is required"}
+		}
+		decoded, err := base64.StdEncoding.DecodeString(p.Data)
+		if err != nil {
+			return agent.TelegramActionResult{Error: "base64 decode failed: " + err.Error()}
+		}
+		params := &telego.SendVoiceParams{
+			ChatID: chatID,
+			Voice:  telego.InputFile{File: tu.NameReader(bytes.NewReader(decoded), "voice.ogg")},
+		}
+		if p.Caption != "" {
+			params.Caption = p.Caption
+		}
+		sent, err := b.bot.SendVoice(ctx, params)
+		if err != nil {
+			return agent.TelegramActionResult{Error: err.Error()}
+		}
+		if sent != nil {
+			return agent.TelegramActionResult{MessageID: sent.MessageID}
+		}
+		return agent.TelegramActionResult{}
+
+	case "send_video_note":
+		var p struct {
+			Data string `json:"data"`
+		}
+		if err := json.Unmarshal(action.Payload, &p); err != nil {
+			return agent.TelegramActionResult{Error: "invalid payload: " + err.Error()}
+		}
+		if p.Data == "" {
+			return agent.TelegramActionResult{Error: "data (base64) is required"}
+		}
+		decoded, err := base64.StdEncoding.DecodeString(p.Data)
+		if err != nil {
+			return agent.TelegramActionResult{Error: "base64 decode failed: " + err.Error()}
+		}
+		sent, err := b.bot.SendVideoNote(ctx, &telego.SendVideoNoteParams{
+			ChatID:    chatID,
+			VideoNote: telego.InputFile{File: tu.NameReader(bytes.NewReader(decoded), "videonote.mp4")},
+		})
+		if err != nil {
+			return agent.TelegramActionResult{Error: err.Error()}
+		}
+		if sent != nil {
+			return agent.TelegramActionResult{MessageID: sent.MessageID}
+		}
+		return agent.TelegramActionResult{}
+
+	case "send_animation":
+		var p struct {
+			URL     string `json:"url"`
+			Data    string `json:"data"`
+			Caption string `json:"caption"`
+		}
+		if err := json.Unmarshal(action.Payload, &p); err != nil {
+			return agent.TelegramActionResult{Error: "invalid payload: " + err.Error()}
+		}
+		var input telego.InputFile
+		if p.URL != "" {
+			input = telego.InputFile{URL: p.URL}
+		} else if p.Data != "" {
+			decoded, err := base64.StdEncoding.DecodeString(p.Data)
+			if err != nil {
+				return agent.TelegramActionResult{Error: "base64 decode failed: " + err.Error()}
+			}
+			input = telego.InputFile{File: tu.NameReader(bytes.NewReader(decoded), "animation.gif")}
+		} else {
+			return agent.TelegramActionResult{Error: "url or data is required"}
+		}
+		params := &telego.SendAnimationParams{
+			ChatID:    chatID,
+			Animation: input,
+		}
+		if p.Caption != "" {
+			params.Caption = p.Caption
+		}
+		sent, err := b.bot.SendAnimation(ctx, params)
+		if err != nil {
+			return agent.TelegramActionResult{Error: err.Error()}
+		}
+		if sent != nil {
+			return agent.TelegramActionResult{MessageID: sent.MessageID}
+		}
+		return agent.TelegramActionResult{}
+
+	case "send_poll":
+		var p struct {
+			Question              string   `json:"question"`
+			Options               []string `json:"options"`
+			IsAnonymous           *bool    `json:"is_anonymous"`
+			Type                  string   `json:"type"`
+			AllowsMultipleAnswers bool     `json:"allows_multiple_answers"`
+			CorrectOptionID       *int     `json:"correct_option_id"`
+			Explanation           string   `json:"explanation"`
+		}
+		if err := json.Unmarshal(action.Payload, &p); err != nil {
+			return agent.TelegramActionResult{Error: "invalid payload: " + err.Error()}
+		}
+		if p.Question == "" || len(p.Options) < 2 {
+			return agent.TelegramActionResult{Error: "question and at least 2 options are required"}
+		}
+		pollOptions := make([]telego.InputPollOption, len(p.Options))
+		for i, o := range p.Options {
+			pollOptions[i] = telego.InputPollOption{Text: o}
+		}
+		params := &telego.SendPollParams{
+			ChatID:                chatID,
+			Question:              p.Question,
+			Options:               pollOptions,
+			AllowsMultipleAnswers: p.AllowsMultipleAnswers,
+		}
+		if p.IsAnonymous != nil {
+			params.IsAnonymous = p.IsAnonymous
+		}
+		if p.CorrectOptionID != nil {
+			params.CorrectOptionID = p.CorrectOptionID
+		}
+		if p.Type != "" {
+			params.Type = p.Type
+		}
+		if p.Explanation != "" {
+			params.Explanation = p.Explanation
+		}
+		sent, err := b.bot.SendPoll(ctx, params)
+		if err != nil {
+			return agent.TelegramActionResult{Error: err.Error()}
+		}
+		if sent != nil {
+			return agent.TelegramActionResult{MessageID: sent.MessageID}
+		}
+		return agent.TelegramActionResult{}
+
+	case "set_reaction":
+		var p struct {
+			MessageID int    `json:"message_id"`
+			Emoji     string `json:"emoji"`
+			IsBig     bool   `json:"is_big"`
+		}
+		if err := json.Unmarshal(action.Payload, &p); err != nil {
+			return agent.TelegramActionResult{Error: "invalid payload: " + err.Error()}
+		}
+		if p.MessageID == 0 || p.Emoji == "" {
+			return agent.TelegramActionResult{Error: "message_id and emoji are required"}
+		}
+		if err := b.bot.SetMessageReaction(ctx, &telego.SetMessageReactionParams{
+			ChatID:    chatID,
+			MessageID: p.MessageID,
+			Reaction: []telego.ReactionType{
+				&telego.ReactionTypeEmoji{Type: "emoji", Emoji: p.Emoji},
+			},
+			IsBig: p.IsBig,
+		}); err != nil {
+			return agent.TelegramActionResult{Error: err.Error()}
+		}
+		return agent.TelegramActionResult{}
+
+	case "pin_message":
+		var p struct {
+			MessageID           int  `json:"message_id"`
+			DisableNotification bool `json:"disable_notification"`
+		}
+		if err := json.Unmarshal(action.Payload, &p); err != nil {
+			return agent.TelegramActionResult{Error: "invalid payload: " + err.Error()}
+		}
+		if p.MessageID == 0 {
+			return agent.TelegramActionResult{Error: "message_id is required"}
+		}
+		if err := b.bot.PinChatMessage(ctx, &telego.PinChatMessageParams{
+			ChatID:              chatID,
+			MessageID:           p.MessageID,
+			DisableNotification: p.DisableNotification,
+		}); err != nil {
+			return agent.TelegramActionResult{Error: err.Error()}
+		}
+		return agent.TelegramActionResult{}
+
+	case "unpin_message":
+		var p struct {
+			MessageID int `json:"message_id"`
+		}
+		if err := json.Unmarshal(action.Payload, &p); err != nil {
+			return agent.TelegramActionResult{Error: "invalid payload: " + err.Error()}
+		}
+		if err := b.bot.UnpinChatMessage(ctx, &telego.UnpinChatMessageParams{
+			ChatID:    chatID,
+			MessageID: p.MessageID,
+		}); err != nil {
+			return agent.TelegramActionResult{Error: err.Error()}
+		}
+		return agent.TelegramActionResult{}
+
+	case "get_chat_info":
+		info, err := b.bot.GetChat(ctx, &telego.GetChatParams{
+			ChatID: chatID,
+		})
+		if err != nil {
+			return agent.TelegramActionResult{Error: err.Error()}
+		}
+		data, _ := json.Marshal(info)
+		return agent.TelegramActionResult{Data: data}
+
+	default:
+		return agent.TelegramActionResult{Error: "unknown action type: " + action.Type}
+	}
+}
+

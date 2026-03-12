@@ -140,6 +140,23 @@ func (s *Store) migrate() error {
 		}
 	}
 
+	// Users table
+	usersMigrations := []string{
+		`CREATE TABLE IF NOT EXISTS users (
+			id           TEXT PRIMARY KEY,
+			username     TEXT UNIQUE,
+			display_name TEXT,
+			password     TEXT NOT NULL DEFAULT '',
+			is_admin     INTEGER DEFAULT 0,
+			created_at   DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`,
+	}
+	for _, m := range usersMigrations {
+		if _, err := s.db.Exec(m); err != nil {
+			return fmt.Errorf("exec users migration: %w", err)
+		}
+	}
+
 	// Add columns (ignore errors if column already exists)
 	for _, stmt := range []string{
 		`ALTER TABLE swarm_runs ADD COLUMN name TEXT DEFAULT ''`,
@@ -147,6 +164,8 @@ func (s *Store) migrate() error {
 		`ALTER TABLE swarm_runs ADD COLUMN lead_agent TEXT DEFAULT ''`,
 		`ALTER TABLE agents ADD COLUMN extensions TEXT DEFAULT '{}'`,
 		`ALTER TABLE agents ADD COLUMN extension_status TEXT DEFAULT '{}'`,
+		`ALTER TABLE agents ADD COLUMN user_id TEXT DEFAULT ''`,
+		`ALTER TABLE agents ADD COLUMN system_prompt TEXT DEFAULT ''`,
 	} {
 		_, _ = s.db.Exec(stmt)
 	}

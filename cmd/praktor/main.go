@@ -93,7 +93,7 @@ func runGateway() error {
 	slog.Info("nats started", "port", config.NATSPort)
 
 	// Agent registry (replaces groups manager)
-	reg := registry.New(db, cfg.Agents, cfg.Defaults, config.AgentsBasePath)
+	reg := registry.New(db, cfg.Agents, cfg.Defaults, config.AgentsBasePath, cfg.Telegram.AllowFrom)
 	if err := reg.Sync(); err != nil {
 		return fmt.Errorf("sync agent registry: %w", err)
 	}

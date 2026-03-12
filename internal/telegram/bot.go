@@ -75,6 +75,9 @@ func NewBot(cfg config.TelegramConfig, orch *agent.Orchestrator, rtr *router.Rou
 	_ = bot.SetMyCommands(context.Background(), &telego.SetMyCommandsParams{
 		Commands: []telego.BotCommand{
 			{Command: "agents", Description: "List available agents"},
+			{Command: "newagent", Description: "Create a new agent"},
+			{Command: "delagent", Description: "Delete an agent"},
+			{Command: "project", Description: "List or switch projects"},
 			{Command: "commands", Description: "Show available commands"},
 			{Command: "start", Description: "Say hello to an agent"},
 			{Command: "stop", Description: "Abort the active agent run"},
@@ -224,6 +227,33 @@ func (b *Bot) Start(ctx context.Context) error {
 		return nil
 	}, th.CommandEqual("nix"))
 
+	handler.HandleMessage(func(hctx *th.Context, message telego.Message) error {
+		if !b.allowedUser(message) {
+			return nil
+		}
+		_, _, payload := tu.ParseCommandPayload(message.Text)
+		b.cmdNewAgent(ctx, message, payload)
+		return nil
+	}, th.CommandEqual("newagent"))
+
+	handler.HandleMessage(func(hctx *th.Context, message telego.Message) error {
+		if !b.allowedUser(message) {
+			return nil
+		}
+		_, _, payload := tu.ParseCommandPayload(message.Text)
+		b.cmdDelAgent(ctx, message, payload)
+		return nil
+	}, th.CommandEqual("delagent"))
+
+	handler.HandleMessage(func(hctx *th.Context, message telego.Message) error {
+		if !b.allowedUser(message) {
+			return nil
+		}
+		_, _, payload := tu.ParseCommandPayload(message.Text)
+		b.cmdProject(ctx, message, payload)
+		return nil
+	}, th.CommandEqual("project"))
+
 	// Catch-all for regular messages
 	handler.HandleMessage(func(hctx *th.Context, message telego.Message) error {
 		b.handleMessage(ctx, message)
@@ -289,14 +319,19 @@ func (b *Bot) handleMessage(ctx context.Context, msg telego.Message) {
 		}
 	}
 
-	// Fall back to normal routing
+	// Fall back to normal routing — use per-user routing
 	if agentID == "" {
 		var err error
-		agentID, cleanedMessage, err = b.router.Route(ctx, text)
+		userIDStr := strconv.FormatInt(userID, 10)
+		agentID, _, cleanedMessage, err = b.router.RouteForUser(ctx, userIDStr, text)
 		if err != nil {
-			slog.Error("routing failed", "error", err)
-			_ = b.SendMessage(ctx, chatID, "Sorry, I couldn't route your message to an agent.")
-			return
+			// Fall back to global routing
+			agentID, cleanedMessage, err = b.router.Route(ctx, text)
+			if err != nil {
+				slog.Error("routing failed", "error", err)
+				_ = b.SendMessage(ctx, chatID, "Sorry, I couldn't route your message to an agent.")
+				return
+			}
 		}
 		if cleanedMessage == "" {
 			cleanedMessage = text
@@ -352,6 +387,7 @@ func (b *Bot) handleMessage(ctx context.Context, msg telego.Message) {
 
 	meta := map[string]string{
 		"sender":    fmt.Sprintf("user:%s", senderID),
+		"user_id":   senderID,
 		"chat_id":   chatIDStr,
 		"msg_id":    strconv.Itoa(msg.MessageID),
 		"chat_type": string(msg.Chat.Type),
@@ -799,7 +835,10 @@ func (b *Bot) cmdReset(ctx context.Context, chatID int64, payload string) {
 
 func (b *Bot) cmdCommands(ctx context.Context, chatID int64) {
 	text := "*Commands*\n\n" +
-		"  /agents — List available agents\n" +
+		"  /agents — List your agents\n" +
+		"  /newagent <name> <description> — Create a new agent\n" +
+		"  /delagent <name> — Delete an agent\n" +
+		"  /project \\[name] — List or switch projects\n" +
 		"  /commands — Show available commands\n" +
 		"  /start \\[agent] — Say hello to an agent\n" +
 		"  /stop \\[agent] — Abort the active agent run\n" +
@@ -832,10 +871,17 @@ func (b *Bot) cmdAgents(ctx context.Context, chatID int64) {
 		if runningSet[a.ID] {
 			status = "running"
 		}
+		// For per-user agents, check container by user-{userID}
+		if a.UserID != "" {
+			containerID := agent.ContainerAgentID(a.UserID)
+			if runningSet[containerID] {
+				status = "running"
+			}
+		}
 
 		model := b.registry.ResolveModel(a.ID)
 
-		sb.WriteString(fmt.Sprintf("*%s*", a.ID))
+		sb.WriteString(fmt.Sprintf("*%s*", a.Name))
 		if a.Description != "" {
 			sb.WriteString(fmt.Sprintf(" — %s", a.Description))
 		}
@@ -852,10 +898,81 @@ func (b *Bot) cmdAgents(ctx context.Context, chatID int64) {
 	}
 
 	if len(agents) == 0 {
-		sb.WriteString("No agents configured.")
+		sb.WriteString("No agents configured. Use /newagent to create one.")
 	}
 
 	_ = b.SendMessage(ctx, chatID, sb.String())
+}
+
+func (b *Bot) cmdNewAgent(ctx context.Context, msg telego.Message, payload string) {
+	chatID := msg.Chat.ID
+	userID := strconv.FormatInt(msg.From.ID, 10)
+
+	args := strings.SplitN(payload, " ", 2)
+	if len(args) == 0 || args[0] == "" {
+		_ = b.SendMessage(ctx, chatID, "Usage: /newagent <name> \\[description]")
+		return
+	}
+
+	name := args[0]
+	description := ""
+	if len(args) > 1 {
+		description = args[1]
+	}
+
+	ag, err := b.registry.CreateAgentForUser(userID, name, description, "", "")
+	if err != nil {
+		_ = b.SendMessage(ctx, chatID, fmt.Sprintf("Failed to create agent: %s", err))
+		return
+	}
+
+	_ = b.SendMessage(ctx, chatID, fmt.Sprintf("Agent *%s* created. Use @%s to talk to it.", ag.Name, ag.Name))
+}
+
+func (b *Bot) cmdDelAgent(ctx context.Context, msg telego.Message, payload string) {
+	chatID := msg.Chat.ID
+	userID := strconv.FormatInt(msg.From.ID, 10)
+
+	name := strings.TrimSpace(payload)
+	if name == "" {
+		_ = b.SendMessage(ctx, chatID, "Usage: /delagent <name>")
+		return
+	}
+
+	ag, err := b.registry.GetAgentByUserAndName(userID, name)
+	if err != nil || ag == nil {
+		_ = b.SendMessage(ctx, chatID, fmt.Sprintf("Agent *%s* not found.", name))
+		return
+	}
+
+	if err := b.registry.DeleteAgentForUser(ag.ID); err != nil {
+		_ = b.SendMessage(ctx, chatID, fmt.Sprintf("Failed to delete agent: %s", err))
+		return
+	}
+
+	_ = b.SendMessage(ctx, chatID, fmt.Sprintf("Agent *%s* deleted.", name))
+}
+
+func (b *Bot) cmdProject(ctx context.Context, msg telego.Message, payload string) {
+	chatID := msg.Chat.ID
+	userID := strconv.FormatInt(msg.From.ID, 10)
+	name := strings.TrimSpace(payload)
+
+	containerID := agent.ContainerAgentID(userID)
+
+	if name == "" {
+		// List projects — send to agent for listing
+		_ = b.orch.HandleMessage(ctx, containerID, "/project list", map[string]string{
+			"user_id": userID,
+			"chat_id": strconv.FormatInt(chatID, 10),
+			"sender":  fmt.Sprintf("user:%s", userID),
+		})
+		return
+	}
+
+	// Switch project — send control command
+	_ = b.SendMessage(ctx, chatID, fmt.Sprintf("Switching to project *%s*...", name))
+	// The project switch happens via the MCP tool in the agent
 }
 
 func (b *Bot) cmdPkg(ctx context.Context, chatID int64, payload string) {

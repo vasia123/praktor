@@ -11,6 +11,7 @@ const entries = [
   ["src/mcp-nix.ts", "out/mcp-nix.mjs"],
   ["src/mcp-file.ts", "out/mcp-file.mjs"],
   ["src/mcp-telegram.ts", "out/mcp-telegram.mjs"],
+  ["src/mcp-projects.ts", "out/mcp-projects.mjs"],
 ];
 
 for (const [entryPoint, outfile] of entries) {

@@ -147,6 +147,12 @@ func (o *Orchestrator) OnFile(listener FileListener) {
 	o.fileListeners = append(o.fileListeners, listener)
 }
 
+// ContainerAgentID returns the container/NATS agent ID for a given user.
+// One container per user: "user-{userID}".
+func ContainerAgentID(userID string) string {
+	return "user-" + userID
+}
+
 func (o *Orchestrator) HandleMessage(ctx context.Context, agentID, text string, meta map[string]string) error {
 	// Ensure agent exists
 	ag, err := o.registry.Get(agentID)
@@ -155,6 +161,15 @@ func (o *Orchestrator) HandleMessage(ctx context.Context, agentID, text string, 
 	}
 	if ag == nil {
 		return fmt.Errorf("agent not registered: %s", agentID)
+	}
+
+	// Determine per-user container ID
+	userID := meta["user_id"]
+	containerID := agentID // legacy: use agentID if no userID
+	if userID != "" {
+		containerID = ContainerAgentID(userID)
+		// Include agent_name in meta for agent-runner to fetch config
+		meta["agent_name"] = ag.Name
 	}
 
 	// Save incoming message
@@ -170,16 +185,18 @@ func (o *Orchestrator) HandleMessage(ctx context.Context, agentID, text string, 
 	_ = o.store.SaveMessage(msg)
 	o.publishMessageEvent(msg)
 
-	// Enqueue message
-	q := o.getQueue(agentID)
+	// Enqueue message (keyed by containerID for per-user container)
+	q := o.getQueue(containerID)
 	q.Enqueue(QueuedMessage{
-		AgentID: agentID,
-		Text:    text,
-		Meta:    meta,
+		AgentID:     agentID,
+		ContainerID: containerID,
+		UserID:      userID,
+		Text:        text,
+		Meta:        meta,
 	})
 
 	// Process queue
-	go o.processQueue(ctx, agentID)
+	go o.processQueue(ctx, containerID)
 
 	return nil
 }
@@ -196,8 +213,8 @@ func (o *Orchestrator) getQueue(agentID string) *AgentQueue {
 	return q
 }
 
-func (o *Orchestrator) processQueue(ctx context.Context, agentID string) {
-	q := o.getQueue(agentID)
+func (o *Orchestrator) processQueue(ctx context.Context, containerID string) {
+	q := o.getQueue(containerID)
 
 	if !q.TryLock() {
 		return // Already processing
@@ -210,13 +227,16 @@ func (o *Orchestrator) processQueue(ctx context.Context, agentID string) {
 			return
 		}
 
-		if err := o.executeMessage(ctx, agentID, msg); err != nil {
-			slog.Error("execute message failed", "agent", agentID, "error", err)
+		if err := o.executeMessage(ctx, containerID, msg); err != nil {
+			slog.Error("execute message failed", "container", containerID, "error", err)
 		}
 	}
 }
 
-func (o *Orchestrator) executeMessage(ctx context.Context, agentID string, msg QueuedMessage) error {
+func (o *Orchestrator) executeMessage(ctx context.Context, containerID string, msg QueuedMessage) error {
+	agentID := msg.AgentID
+	userID := msg.UserID
+
 	// Resolve agent config from registry
 	def, hasDef := o.registry.GetDefinition(agentID)
 
@@ -225,16 +245,23 @@ func (o *Orchestrator) executeMessage(ctx context.Context, agentID string, msg Q
 		return fmt.Errorf("get agent: %w", err)
 	}
 
-	// Ensure container is running
-	info := o.containers.GetRunning(agentID)
+	// Determine workspace: per-user workspace if userID is set
+	workspace := ag.Workspace
+	if userID != "" {
+		workspace = "user-" + userID
+	}
+
+	// Ensure container is running (keyed by containerID, e.g. "user-123")
+	info := o.containers.GetRunning(containerID)
 	if info == nil {
 		// Capture NATS client count before starting so we can detect when agent connects
 		clientsBefore := o.bus.NumClients()
-		slog.Info("starting agent", "agent", agentID, "nats_clients_before", clientsBefore)
+		slog.Info("starting user container", "container", containerID, "agent", agentID, "nats_clients_before", clientsBefore)
 
 		opts := container.AgentOpts{
-			AgentID:   agentID,
-			Workspace: ag.Workspace,
+			AgentID:   containerID,
+			UserID:    userID,
+			Workspace: workspace,
 			Model:     o.registry.ResolveModel(agentID),
 			Image:     o.registry.ResolveImage(agentID),
 			NATSUrl:   o.bus.AgentNATSURL(),
@@ -262,7 +289,7 @@ func (o *Orchestrator) executeMessage(ctx context.Context, agentID string, msg Q
 		for {
 			select {
 			case <-deadline:
-				slog.Warn("agent ready timeout, sending anyway", "agent", agentID, "nats_clients", o.bus.NumClients())
+				slog.Warn("agent ready timeout, sending anyway", "container", containerID, "nats_clients", o.bus.NumClients())
 				break waitLoop
 			case <-ctx.Done():
 				return ctx.Err()
@@ -271,46 +298,53 @@ func (o *Orchestrator) executeMessage(ctx context.Context, agentID string, msg Q
 				if current > clientsBefore {
 					// Give the agent a moment to set up subscriptions after connecting
 					time.Sleep(500 * time.Millisecond)
-					slog.Info("agent container ready", "agent", agentID, "nats_clients", current)
+					slog.Info("agent container ready", "container", containerID, "nats_clients", current)
 					break waitLoop
 				}
 			}
 		}
 
 		now := time.Now()
-		o.sessions.Set(agentID, &Session{
+		o.sessions.Set(containerID, &Session{
 			ID:          info.ID,
-			AgentID:     agentID,
+			AgentID:     containerID,
 			ContainerID: info.ID,
 			Status:      "running",
 			StartedAt:   now,
 			LastActive:  now,
 		})
 
-		o.publishAgentStartEvent(agentID)
+		o.publishAgentStartEvent(containerID)
 	}
 
 	// Send message to container via NATS
 	payload := map[string]string{
 		"text":    msg.Text,
-		"agentID": agentID,
+		"agentID": containerID,
 	}
 	for k, v := range msg.Meta {
 		payload[k] = v
 	}
+	// Always include agent_name and user_id in payload
+	if ag.Name != "" {
+		payload["agent_name"] = ag.Name
+	}
+	if userID != "" {
+		payload["user_id"] = userID
+	}
 
-	// Store meta so output handler can route responses back
+	// Store meta so output handler can route responses back (keyed by containerID)
 	o.mu.Lock()
-	o.lastMeta[agentID] = msg.Meta
+	o.lastMeta[containerID] = msg.Meta
 	o.mu.Unlock()
 
 	data, _ := json.Marshal(payload)
-	topic := natsbus.TopicAgentInput(agentID)
-	slog.Info("publishing message to agent", "agent", agentID, "topic", topic)
+	topic := natsbus.TopicAgentInput(containerID)
+	slog.Info("publishing message to agent", "container", containerID, "agent", agentID, "topic", topic)
 	if err := o.client.Publish(topic, data); err != nil {
 		return fmt.Errorf("publish message: %w", err)
 	}
-	o.sessions.Touch(agentID)
+	o.sessions.Touch(containerID)
 	return o.client.Flush()
 }
 
@@ -478,6 +512,8 @@ func (o *Orchestrator) handleIPC(msg *nats.Msg) {
 		o.ipcUpdateUserMD(msg, cmd.Payload)
 	case "swarm_message":
 		o.ipcSwarmMessage(msg, agentID, cmd.Payload)
+	case "get_agent_config":
+		o.ipcGetAgentConfig(msg, cmd.Payload)
 	case "extension_status":
 		o.ipcExtensionStatus(msg, agentID, cmd.Payload)
 	case "send_file":
@@ -747,6 +783,46 @@ func (o *Orchestrator) ipcSendFile(msg *nats.Msg, agentID string, payload json.R
 	o.respondIPC(msg, map[string]any{"ok": true})
 }
 
+func (o *Orchestrator) ipcGetAgentConfig(msg *nats.Msg, payload json.RawMessage) {
+	var req struct {
+		UserID    string `json:"user_id"`
+		AgentName string `json:"agent_name"`
+	}
+	if err := json.Unmarshal(payload, &req); err != nil {
+		o.respondIPC(msg, map[string]any{"error": "invalid payload"})
+		return
+	}
+	if req.UserID == "" || req.AgentName == "" {
+		o.respondIPC(msg, map[string]any{"error": "user_id and agent_name are required"})
+		return
+	}
+
+	ag, err := o.registry.GetAgentByUserAndName(req.UserID, req.AgentName)
+	if err != nil {
+		o.respondIPC(msg, map[string]any{"error": fmt.Sprintf("lookup failed: %v", err)})
+		return
+	}
+	if ag == nil {
+		o.respondIPC(msg, map[string]any{"error": fmt.Sprintf("agent %q not found for user %s", req.AgentName, req.UserID)})
+		return
+	}
+
+	result := map[string]any{
+		"ok":            true,
+		"model":         ag.Model,
+		"system_prompt": ag.SystemPrompt,
+	}
+
+	// Check YAML definition for additional config (allowed_tools, extensions)
+	if def, ok := o.registry.GetDefinition(ag.ID); ok {
+		if len(def.AllowedTools) > 0 {
+			result["allowed_tools"] = def.AllowedTools
+		}
+	}
+
+	o.respondIPC(msg, result)
+}
+
 func (o *Orchestrator) publishMessageEvent(msg *store.Message) {
 	if o.client == nil {
 		return
@@ -801,6 +877,7 @@ func (o *Orchestrator) EnsureAgent(ctx context.Context, agentID string) error {
 
 	opts := container.AgentOpts{
 		AgentID:   agentID,
+		UserID:    ag.UserID,
 		Workspace: ag.Workspace,
 		Model:     o.registry.ResolveModel(agentID),
 		Image:     o.registry.ResolveImage(agentID),
@@ -851,6 +928,12 @@ waitLoop:
 	})
 	o.publishAgentStartEvent(agentID)
 	return nil
+}
+
+// EnsureUserContainer ensures a per-user container is running.
+func (o *Orchestrator) EnsureUserContainer(ctx context.Context, userID string) error {
+	containerID := ContainerAgentID(userID)
+	return o.EnsureAgent(ctx, containerID)
 }
 
 // AbortSession sends an abort control command to a running agent,

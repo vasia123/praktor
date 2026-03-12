@@ -31,6 +31,7 @@ func (r *Router) SetOrchestrator(orch Orchestrator) {
 	r.orch = orch
 }
 
+// Route routes a message to the correct agent (legacy: global agent lookup).
 func (r *Router) Route(ctx context.Context, message string) (agentID string, cleanedMessage string, err error) {
 	// 0. Check for @swarm prefix
 	if strings.HasPrefix(message, "@swarm ") {
@@ -48,7 +49,7 @@ func (r *Router) Route(ctx context.Context, message string) (agentID string, cle
 			}
 			return name, cleaned, nil
 		}
-		// Unknown agent name in prefix — fall through to smart routing
+		// Fall through to smart routing
 	}
 
 	// 2. Try smart routing via default agent
@@ -74,6 +75,53 @@ func (r *Router) Route(ctx context.Context, message string) (agentID string, cle
 		return "", message, fmt.Errorf("no default agent configured")
 	}
 	return r.defaultAgent, message, nil
+}
+
+// RouteForUser routes a message for a specific user, looking up agents from the DB.
+func (r *Router) RouteForUser(ctx context.Context, userID, message string) (agentID string, agentName string, cleanedMessage string, err error) {
+	// 0. Check for @swarm prefix
+	if strings.HasPrefix(message, "@swarm ") {
+		return "swarm", "swarm", strings.TrimPrefix(message, "@swarm "), nil
+	}
+
+	// 1. Check for @agent_name prefix
+	if strings.HasPrefix(message, "@") {
+		parts := strings.SplitN(message, " ", 2)
+		name := strings.TrimPrefix(parts[0], "@")
+
+		// Look up in user's agents
+		ag, err := r.registry.GetAgentByUserAndName(userID, name)
+		if err == nil && ag != nil {
+			cleaned := ""
+			if len(parts) > 1 {
+				cleaned = parts[1]
+			}
+			return ag.ID, ag.Name, cleaned, nil
+		}
+
+		// Also check global YAML agents
+		if _, ok := r.registry.GetDefinition(name); ok {
+			cleaned := ""
+			if len(parts) > 1 {
+				cleaned = parts[1]
+			}
+			return name, name, cleaned, nil
+		}
+		// Fall through to default
+	}
+
+	// 2. Find default agent for user (first agent)
+	agents, err := r.registry.ListByUser(userID)
+	if err != nil || len(agents) == 0 {
+		// Fall back to global default agent
+		if r.defaultAgent != "" {
+			return r.defaultAgent, r.defaultAgent, message, nil
+		}
+		return "", "", message, fmt.Errorf("no agents configured for user %s", userID)
+	}
+
+	// Use first agent as default
+	return agents[0].ID, agents[0].Name, message, nil
 }
 
 func (r *Router) DefaultAgent() string {

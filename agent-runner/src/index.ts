@@ -21,19 +21,31 @@ console.error = (...args: unknown[]) => origError(ts(), ...args);
 
 const NATS_URL = process.env.NATS_URL || "nats://localhost:4222";
 const AGENT_ID = process.env.AGENT_ID || process.env.GROUP_ID || "default";
+const USER_ID = process.env.USER_ID || "";
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || undefined;
 const ALLOWED_TOOLS_ENV = process.env.ALLOWED_TOOLS || "";
 const SWARM_CHAT_TOPIC = process.env.SWARM_CHAT_TOPIC || "";
 const SWARM_ROLE = process.env.SWARM_ROLE || "";
 
 let bridge: NatsBridge;
-// Per-chat session isolation: each chat_id gets its own Claude Code session
-const sessionsByChat = new Map<string, string>(); // chat_id → session_id
+// Per-chat:agent session isolation
+const sessionsByKey = new Map<string, string>(); // "chatID:agentName" → session_id
 const processingChats = new Set<string>(); // chat_ids currently being processed
 const pendingByChat = new Map<string, Array<Record<string, unknown>>>(); // per-chat message queues
 const abortedChats = new Set<string>(); // chat_ids that have been aborted
 const currentQueryIters = new Map<string, AsyncIterator<unknown>>(); // per-chat query iterators
 let extensionMcpServers: Record<string, { type: string; command?: string; args?: string[]; url?: string; env?: Record<string, string>; headers?: Record<string, string> }> = {};
+
+// Per-chat active project
+const activeProjects = new Map<string, string>(); // chatID → projectName
+
+// Agent config cache (fetched from host via IPC)
+interface AgentConfig {
+  model?: string;
+  system_prompt?: string;
+  allowed_tools?: string[];
+}
+const agentConfigCache = new Map<string, AgentConfig>();
 
 // Swarm collaborative chat buffer
 interface ChatMessage {
@@ -47,6 +59,10 @@ export function parseAllowedTools(env: string): string[] | undefined {
   if (!env) return undefined;
   const tools = env.split(",").map((t) => t.trim()).filter(Boolean);
   return tools.length > 0 ? tools : undefined;
+}
+
+function sessionKey(chatID: string, agentName: string): string {
+  return `${chatID}:${agentName}`;
 }
 
 function installGlobalInstructions(): void {
@@ -89,6 +105,17 @@ function ensureAgentMd(): void {
   }
 }
 
+function ensureWorkspace(): void {
+  const wsRoot = "/workspace/agent";
+  const claudeMd = join(wsRoot, "CLAUDE.md");
+  if (!existsSync(claudeMd)) {
+    mkdirSync(join(wsRoot, "projects"), { recursive: true });
+    mkdirSync(join(wsRoot, "uploads"), { recursive: true });
+    writeFileSync(claudeMd, "# Workspace\n\n## Projects\n\nNo projects yet.\n");
+    console.log("[agent] initialized workspace structure");
+  }
+}
+
 function setupPlaywrightCli(): void {
   const optDir = "/opt/playwright-cli";
   if (!existsSync(optDir)) return; // playwright-cli not baked into image
@@ -113,8 +140,37 @@ function setupPlaywrightCli(): void {
   }
 }
 
-function loadSystemPrompt(includeIdentity = true, meta?: Record<string, string | undefined>): string {
+async function getAgentConfig(agentName: string, userId: string): Promise<AgentConfig> {
+  const cacheKey = `${userId}:${agentName}`;
+  const cached = agentConfigCache.get(cacheKey);
+  if (cached) return cached;
+
+  try {
+    const { sendIPC } = await import("./ipc.js");
+    const resp = await sendIPC("get_agent_config", { user_id: userId, agent_name: agentName });
+    if (resp.ok) {
+      const config: AgentConfig = {
+        model: (resp as any).model || undefined,
+        system_prompt: (resp as any).system_prompt || undefined,
+        allowed_tools: (resp as any).allowed_tools || undefined,
+      };
+      agentConfigCache.set(cacheKey, config);
+      return config;
+    }
+    console.warn(`[agent] get_agent_config failed: ${resp.error}`);
+  } catch (err) {
+    console.warn("[agent] get_agent_config IPC error:", err);
+  }
+  return {};
+}
+
+function loadSystemPrompt(includeIdentity = true, meta?: Record<string, string | undefined>, agentSystemPrompt?: string): string {
   const parts: string[] = [];
+
+  // Agent-specific system prompt from DB (if provided)
+  if (agentSystemPrompt) {
+    parts.push(agentSystemPrompt);
+  }
 
   // User profile (loaded before global instructions so agents know the user)
   try {
@@ -145,6 +201,30 @@ function loadSystemPrompt(includeIdentity = true, meta?: Record<string, string |
     parts.push(global);
   } catch {
     // Global instructions not available
+  }
+
+  // Project context: load project CLAUDE.md if in a project
+  if (meta?.active_project) {
+    try {
+      const projectMd = readFileSync(`/workspace/agent/projects/${meta.active_project}/CLAUDE.md`, "utf-8");
+      parts.push(`PROJECT: ${meta.active_project}\n\n${projectMd}`);
+    } catch {
+      // Project CLAUDE.md not available
+    }
+  }
+
+  // Projects list
+  try {
+    const projectsDir = "/workspace/agent/projects";
+    if (existsSync(projectsDir)) {
+      const entries = readdirSync(projectsDir, { withFileTypes: true });
+      const projects = entries.filter(e => e.isDirectory()).map(e => e.name);
+      if (projects.length > 0) {
+        parts.push(`PROJECTS\nAvailable projects: ${projects.join(", ")}\nUse project_switch MCP tool to change the active project.`);
+      }
+    }
+  } catch {
+    // Projects dir not accessible
   }
 
   // Nix package manager: detect nix-daemon and inform agent
@@ -280,6 +360,8 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
   if (!text) return;
 
   const chatID = (data.chat_id as string) || "_default";
+  const agentName = (data.agent_name as string) || "";
+  const userId = (data.user_id as string) || USER_ID;
 
   // Per-chat serialization: queue if this chat is already being processed
   if (processingChats.has(chatID)) {
@@ -292,16 +374,37 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
 
   processingChats.add(chatID);
   abortedChats.delete(chatID);
-  console.log(`[agent] processing message for agent ${AGENT_ID} chat ${chatID}: ${text.substring(0, 100)}...`);
+  console.log(`[agent] processing message for agent ${agentName || AGENT_ID} chat ${chatID}: ${text.substring(0, 100)}...`);
 
   try {
+    // Fetch agent config from host if we have a user_id and agent_name
+    let agentConfig: AgentConfig = {};
+    if (userId && agentName) {
+      agentConfig = await getAgentConfig(agentName, userId);
+    }
+
     // Extract meta fields from the incoming data for system prompt context
     const meta: Record<string, string | undefined> = {};
     for (const key of ["chat_id", "msg_id", "chat_type", "username", "first_name", "last_name", "chat_title", "reply_to_msg_id", "reply_to_text"]) {
       if (typeof data[key] === "string") meta[key] = data[key] as string;
     }
-    const systemPrompt = loadSystemPrompt(true, Object.keys(meta).length > 0 ? meta : undefined);
-    const cwd = "/workspace/agent";
+
+    // Set active project in meta
+    const activeProject = activeProjects.get(chatID);
+    if (activeProject) {
+      meta.active_project = activeProject;
+    }
+
+    const systemPrompt = loadSystemPrompt(true, Object.keys(meta).length > 0 ? meta : undefined, agentConfig.system_prompt);
+
+    // Determine cwd: per-project if active
+    let cwd = "/workspace/agent";
+    if (activeProject) {
+      const projectDir = `/workspace/agent/projects/${activeProject}`;
+      if (existsSync(projectDir)) {
+        cwd = projectDir;
+      }
+    }
 
     // Prepend swarm chat context if in collaborative mode
     let augmentedText = text;
@@ -313,9 +416,15 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
       console.log(`[agent] prepended ${chatHistory.length} chat messages to prompt`);
     }
 
-    console.log(`[agent] starting claude query, cwd=${cwd}, chat=${chatID}`);
+    console.log(`[agent] starting claude query, cwd=${cwd}, chat=${chatID}, agent=${agentName}`);
 
-    const configuredTools = parseAllowedTools(ALLOWED_TOOLS_ENV);
+    // Determine model: agent config > env > default
+    const model = agentConfig.model || CLAUDE_MODEL;
+
+    // Determine allowed tools: agent config > env > default
+    const configuredTools = agentConfig.allowed_tools
+      ? agentConfig.allowed_tools
+      : parseAllowedTools(ALLOWED_TOOLS_ENV);
     const allowedTools = configuredTools || [
       "Bash",
       "Read",
@@ -330,11 +439,14 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
       "mcp__praktor-*",
     ];
 
-    const chatSessionId = sessionsByChat.get(chatID);
+    // Session key: chatID:agentName for per-agent isolation
+    const sessKey = sessionKey(chatID, agentName || AGENT_ID);
+    const chatSessionId = sessionsByKey.get(sessKey);
+
     const result = query({
       prompt: augmentedText,
       options: {
-        model: CLAUDE_MODEL,
+        model,
         cwd,
         pathToClaudeCodeExecutable: "/usr/local/bin/claude",
         systemPrompt: systemPrompt || undefined,
@@ -377,6 +489,12 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
             args: ["/app/mcp-telegram.mjs"],
             env: { NATS_URL, AGENT_ID },
           },
+          "praktor-projects": {
+            type: "stdio",
+            command: "node",
+            args: ["/app/mcp-projects.mjs"],
+            env: { NATS_URL, AGENT_ID },
+          },
           ...(SWARM_CHAT_TOPIC ? {
             "praktor-swarm": {
               type: "stdio",
@@ -404,7 +522,7 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
         console.log(`[agent] [${chatID}] event: type=${event.type}${"subtype" in event ? ` subtype=${event.subtype}` : ""}`);
         if (event.type === "result" && event.subtype === "success") {
           fullResponse = event.result;
-          sessionsByChat.set(chatID, event.session_id);
+          sessionsByKey.set(sessKey, event.session_id);
         } else if (event.type === "assistant") {
           for (const block of event.message.content) {
             if (block.type === "text") {
@@ -431,7 +549,7 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
       await bridge.publishResult(fullResponse);
     }
 
-    console.log(`[agent] completed processing for agent ${AGENT_ID} chat ${chatID} (session=${sessionsByChat.get(chatID)})`);
+    console.log(`[agent] completed processing for agent ${agentName || AGENT_ID} chat ${chatID} (session=${sessionsByKey.get(sessKey)})`);
   } catch (err) {
     if (abortedChats.has(chatID)) {
       console.log(`[agent] query aborted for chat ${chatID}`);
@@ -521,6 +639,19 @@ async function handleControl(
     case "ping":
       msg.respond(new TextEncoder().encode(JSON.stringify({ status: "ok" })));
       break;
+    case "set_active_project": {
+      const chatId = data.chat_id as string;
+      const projectName = data.project as string;
+      if (chatId && projectName) {
+        activeProjects.set(chatId, projectName);
+        console.log(`[agent] active project set to ${projectName} for chat ${chatId}`);
+      } else if (chatId && !projectName) {
+        activeProjects.delete(chatId);
+        console.log(`[agent] active project cleared for chat ${chatId}`);
+      }
+      msg.respond(new TextEncoder().encode(JSON.stringify({ status: "ok" })));
+      break;
+    }
     case "abort": {
       const abortChatID = data.chat_id as string;
       if (abortChatID) {
@@ -556,12 +687,16 @@ async function handleControl(
     case "clear_session": {
       const clearChatID = data.chat_id as string;
       if (clearChatID) {
-        // Per-chat session clear
-        sessionsByChat.delete(clearChatID);
+        // Per-chat session clear — clear all agent sessions for this chat
+        for (const key of sessionsByKey.keys()) {
+          if (key.startsWith(`${clearChatID}:`)) {
+            sessionsByKey.delete(key);
+          }
+        }
         console.log(`[agent] session cleared for chat ${clearChatID}`);
       } else {
         // Global session clear
-        sessionsByChat.clear();
+        sessionsByKey.clear();
         for (const dir of [
           "/home/praktor/.claude/projects",
           "/home/praktor/.claude/sessions",
@@ -583,11 +718,12 @@ async function handleControl(
 }
 
 async function main(): Promise<void> {
-  console.log(`[agent] starting for agent ${AGENT_ID}`);
+  console.log(`[agent] starting for agent ${AGENT_ID}${USER_ID ? ` (user ${USER_ID})` : ""}`);
   console.log(`[agent] NATS URL: ${NATS_URL}`);
 
   installGlobalInstructions();
   ensureAgentMd();
+  ensureWorkspace();
   setupPlaywrightCli();
 
   // Apply agent extensions (MCP servers, plugins, skills, settings)

@@ -47,6 +47,7 @@ type ContainerInfo struct {
 
 type AgentOpts struct {
 	AgentID      string
+	UserID       string
 	Workspace    string
 	Model        string
 	Image        string
@@ -135,6 +136,9 @@ func (m *Manager) StartAgent(ctx context.Context, opts AgentOpts) (*ContainerInf
 	env := []string{
 		fmt.Sprintf("NATS_URL=%s", opts.NATSUrl),
 		fmt.Sprintf("AGENT_ID=%s", opts.AgentID),
+	}
+	if opts.UserID != "" {
+		env = append(env, fmt.Sprintf("USER_ID=%s", opts.UserID))
 	}
 	if opts.SessionID != "" {
 		env = append(env, fmt.Sprintf("SESSION_ID=%s", opts.SessionID))

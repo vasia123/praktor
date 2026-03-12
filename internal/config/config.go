@@ -156,7 +156,7 @@ func validate(cfg *Config) error {
 	if len(cfg.Agents) > 0 && cfg.Router.DefaultAgent == "" {
 		return fmt.Errorf("router.default_agent is required when agents are defined")
 	}
-	if cfg.Router.DefaultAgent != "" {
+	if cfg.Router.DefaultAgent != "" && len(cfg.Agents) > 0 {
 		if _, ok := cfg.Agents[cfg.Router.DefaultAgent]; !ok {
 			return fmt.Errorf("router.default_agent %q not found in agents map", cfg.Router.DefaultAgent)
 		}

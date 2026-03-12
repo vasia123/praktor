@@ -71,6 +71,9 @@ func (s *Server) registerAPI(mux *http.ServeMux) {
 
 	// System
 	mux.HandleFunc("GET /api/status", s.getStatus)
+
+	// Per-user and admin endpoints
+	s.registerUserAPI(mux)
 }
 
 func (s *Server) listAgentDefinitions(w http.ResponseWriter, r *http.Request) {

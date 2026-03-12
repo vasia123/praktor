@@ -1,14 +1,28 @@
-import { useState, useEffect, useCallback, lazy, Suspense } from 'react';
+import { useState, useEffect, useCallback, lazy, Suspense, createContext, useContext } from 'react';
 import { Routes, Route, NavLink } from 'react-router-dom';
 import Login from './components/Login';
 
 const Dashboard = lazy(() => import('./pages/Dashboard'));
 const Agents = lazy(() => import('./pages/Agents'));
+const MyAgents = lazy(() => import('./pages/MyAgents'));
 const Conversations = lazy(() => import('./pages/Conversations'));
 const Tasks = lazy(() => import('./pages/Tasks'));
 const Secrets = lazy(() => import('./pages/Secrets'));
 const Swarms = lazy(() => import('./pages/Swarms'));
 const UserProfile = lazy(() => import('./pages/UserProfile'));
+const Users = lazy(() => import('./pages/Users'));
+
+interface UserInfo {
+  user_id: string;
+  username: string;
+  is_admin: boolean;
+}
+
+const UserContext = createContext<UserInfo | null>(null);
+
+export function useUser() {
+  return useContext(UserContext);
+}
 
 // SVG icon components (16x16)
 function IconDashboard() {
@@ -126,9 +140,31 @@ function IconLogout() {
   );
 }
 
-const navItems = [
+function IconUsers() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="6" cy="4.5" r="2.5" />
+      <path d="M1 13c0-2.5 2.2-4.5 5-4.5s5 2 5 4.5" />
+      <circle cx="12" cy="5" r="2" />
+      <path d="M12 8.5c1.7 0 3 1.3 3 3" />
+    </svg>
+  );
+}
+
+function IconMyAgents() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="8" cy="5" r="3" />
+      <path d="M3 14c0-2.5 2.2-4.5 5-4.5s5 2 5 4.5" />
+      <path d="M12 2l1 1-3 3-1-1z" />
+    </svg>
+  );
+}
+
+const baseNavItems = [
   { to: '/', label: 'Dashboard', Icon: IconDashboard },
   { to: '/agents', label: 'Agents', Icon: IconAgents },
+  { to: '/my-agents', label: 'My Agents', Icon: IconMyAgents },
   { to: '/conversations', label: 'Conversations', Icon: IconConversations },
   { to: '/tasks', label: 'Scheduled Tasks', Icon: IconTasks },
   { to: '/secrets', label: 'Secrets', Icon: IconSecrets },
@@ -136,11 +172,16 @@ const navItems = [
   { to: '/user', label: 'User', Icon: IconUser },
 ];
 
+const adminNavItems = [
+  { to: '/admin/users', label: 'Users', Icon: IconUsers },
+];
+
 function App() {
   const [theme, setTheme] = useState<'dark' | 'light'>(() => {
     return (localStorage.getItem('praktor-theme') as 'dark' | 'light') || 'dark';
   });
   const [authState, setAuthState] = useState<'loading' | 'authenticated' | 'unauthenticated'>('loading');
+  const [user, setUser] = useState<UserInfo | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
   const closeSidebar = useCallback(() => setSidebarOpen(false), []);
@@ -151,11 +192,18 @@ function App() {
   }, [theme]);
 
   useEffect(() => {
-    fetch('/api/auth/check').then((res) => {
+    fetch('/api/auth/check').then(async (res) => {
       if (res.status === 204) {
         // No auth configured
+        setUser({ user_id: '', username: 'admin', is_admin: true });
         setAuthState('authenticated');
       } else if (res.ok) {
+        const data = await res.json();
+        setUser({
+          user_id: data.user_id || '',
+          username: data.username || 'admin',
+          is_admin: data.is_admin ?? true,
+        });
         setAuthState('authenticated');
       } else {
         setAuthState('unauthenticated');
@@ -171,15 +219,24 @@ function App() {
 
   const handleLogout = useCallback(async () => {
     await fetch('/api/logout', { method: 'POST' });
+    setUser(null);
     setAuthState('unauthenticated');
   }, []);
 
+  const handleLogin = useCallback((userInfo: UserInfo) => {
+    setUser(userInfo);
+    setAuthState('authenticated');
+  }, []);
+
+  const navItems = [...baseNavItems, ...(user?.is_admin ? adminNavItems : [])];
+
   if (authState === 'loading') return null;
   if (authState === 'unauthenticated') {
-    return <Login onLogin={() => setAuthState('authenticated')} />;
+    return <Login onLogin={handleLogin} />;
   }
 
   return (
+    <UserContext.Provider value={user}>
     <div style={{ display: 'flex', minHeight: '100vh' }}>
       {/* Hamburger button (mobile only) */}
       <button
@@ -375,14 +432,17 @@ function App() {
             <Route path="/" element={<Dashboard />} />
             <Route path="/user" element={<UserProfile />} />
             <Route path="/agents" element={<Agents />} />
+            <Route path="/my-agents" element={<MyAgents />} />
             <Route path="/conversations" element={<Conversations />} />
             <Route path="/tasks" element={<Tasks />} />
             <Route path="/secrets" element={<Secrets />} />
             <Route path="/swarms" element={<Swarms />} />
+            {user?.is_admin && <Route path="/admin/users" element={<Users />} />}
           </Routes>
         </Suspense>
       </main>
     </div>
+    </UserContext.Provider>
   );
 }
 

@@ -7,21 +7,23 @@ import (
 )
 
 type Agent struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Description string    `json:"description,omitempty"`
-	Model       string    `json:"model,omitempty"`
-	Image       string    `json:"image,omitempty"`
-	Workspace   string    `json:"workspace"`
-	ClaudeMD    string    `json:"claude_md,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID           string    `json:"id"`
+	Name         string    `json:"name"`
+	Description  string    `json:"description,omitempty"`
+	Model        string    `json:"model,omitempty"`
+	Image        string    `json:"image,omitempty"`
+	Workspace    string    `json:"workspace"`
+	ClaudeMD     string    `json:"claude_md,omitempty"`
+	UserID       string    `json:"user_id,omitempty"`
+	SystemPrompt string    `json:"system_prompt,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 func (s *Store) SaveAgent(a *Agent) error {
 	_, err := s.db.Exec(`
-		INSERT INTO agents (id, name, description, model, image, workspace, claude_md, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+		INSERT INTO agents (id, name, description, model, image, workspace, claude_md, user_id, system_prompt, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
 		ON CONFLICT(id) DO UPDATE SET
 			name = excluded.name,
 			description = excluded.description,
@@ -29,8 +31,10 @@ func (s *Store) SaveAgent(a *Agent) error {
 			image = excluded.image,
 			workspace = excluded.workspace,
 			claude_md = excluded.claude_md,
+			user_id = excluded.user_id,
+			system_prompt = excluded.system_prompt,
 			updated_at = CURRENT_TIMESTAMP`,
-		a.ID, a.Name, a.Description, a.Model, a.Image, a.Workspace, a.ClaudeMD)
+		a.ID, a.Name, a.Description, a.Model, a.Image, a.Workspace, a.ClaudeMD, a.UserID, a.SystemPrompt)
 	if err != nil {
 		return fmt.Errorf("save agent: %w", err)
 	}
@@ -39,9 +43,9 @@ func (s *Store) SaveAgent(a *Agent) error {
 
 func (s *Store) GetAgent(id string) (*Agent, error) {
 	a := &Agent{}
-	var description, model, image, claudeMD sql.NullString
-	err := s.db.QueryRow(`SELECT id, name, description, model, image, workspace, claude_md, created_at, updated_at FROM agents WHERE id = ?`, id).
-		Scan(&a.ID, &a.Name, &description, &model, &image, &a.Workspace, &claudeMD, &a.CreatedAt, &a.UpdatedAt)
+	var description, model, image, claudeMD, userID, systemPrompt sql.NullString
+	err := s.db.QueryRow(`SELECT id, name, description, model, image, workspace, claude_md, user_id, system_prompt, created_at, updated_at FROM agents WHERE id = ?`, id).
+		Scan(&a.ID, &a.Name, &description, &model, &image, &a.Workspace, &claudeMD, &userID, &systemPrompt, &a.CreatedAt, &a.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -52,11 +56,13 @@ func (s *Store) GetAgent(id string) (*Agent, error) {
 	a.Model = model.String
 	a.Image = image.String
 	a.ClaudeMD = claudeMD.String
+	a.UserID = userID.String
+	a.SystemPrompt = systemPrompt.String
 	return a, nil
 }
 
 func (s *Store) ListAgents() ([]Agent, error) {
-	rows, err := s.db.Query(`SELECT id, name, description, model, image, workspace, claude_md, created_at, updated_at FROM agents ORDER BY created_at`)
+	rows, err := s.db.Query(`SELECT id, name, description, model, image, workspace, claude_md, user_id, system_prompt, created_at, updated_at FROM agents ORDER BY created_at`)
 	if err != nil {
 		return nil, fmt.Errorf("list agents: %w", err)
 	}
@@ -65,17 +71,64 @@ func (s *Store) ListAgents() ([]Agent, error) {
 	var agents []Agent
 	for rows.Next() {
 		var a Agent
-		var description, model, image, claudeMD sql.NullString
-		if err := rows.Scan(&a.ID, &a.Name, &description, &model, &image, &a.Workspace, &claudeMD, &a.CreatedAt, &a.UpdatedAt); err != nil {
+		var description, model, image, claudeMD, userID, systemPrompt sql.NullString
+		if err := rows.Scan(&a.ID, &a.Name, &description, &model, &image, &a.Workspace, &claudeMD, &userID, &systemPrompt, &a.CreatedAt, &a.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan agent: %w", err)
 		}
 		a.Description = description.String
 		a.Model = model.String
 		a.Image = image.String
 		a.ClaudeMD = claudeMD.String
+		a.UserID = userID.String
+		a.SystemPrompt = systemPrompt.String
 		agents = append(agents, a)
 	}
 	return agents, rows.Err()
+}
+
+func (s *Store) ListAgentsByUser(userID string) ([]Agent, error) {
+	rows, err := s.db.Query(`SELECT id, name, description, model, image, workspace, claude_md, user_id, system_prompt, created_at, updated_at FROM agents WHERE user_id = ? ORDER BY created_at`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("list agents by user: %w", err)
+	}
+	defer rows.Close()
+
+	var agents []Agent
+	for rows.Next() {
+		var a Agent
+		var description, model, image, claudeMD, uid, systemPrompt sql.NullString
+		if err := rows.Scan(&a.ID, &a.Name, &description, &model, &image, &a.Workspace, &claudeMD, &uid, &systemPrompt, &a.CreatedAt, &a.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan agent: %w", err)
+		}
+		a.Description = description.String
+		a.Model = model.String
+		a.Image = image.String
+		a.ClaudeMD = claudeMD.String
+		a.UserID = uid.String
+		a.SystemPrompt = systemPrompt.String
+		agents = append(agents, a)
+	}
+	return agents, rows.Err()
+}
+
+func (s *Store) GetAgentByUserAndName(userID, name string) (*Agent, error) {
+	a := &Agent{}
+	var description, model, image, claudeMD, uid, systemPrompt sql.NullString
+	err := s.db.QueryRow(`SELECT id, name, description, model, image, workspace, claude_md, user_id, system_prompt, created_at, updated_at FROM agents WHERE user_id = ? AND name = ?`, userID, name).
+		Scan(&a.ID, &a.Name, &description, &model, &image, &a.Workspace, &claudeMD, &uid, &systemPrompt, &a.CreatedAt, &a.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get agent by user and name: %w", err)
+	}
+	a.Description = description.String
+	a.Model = model.String
+	a.Image = image.String
+	a.ClaudeMD = claudeMD.String
+	a.UserID = uid.String
+	a.SystemPrompt = systemPrompt.String
+	return a, nil
 }
 
 func (s *Store) DeleteAgent(id string) error {

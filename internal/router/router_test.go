@@ -24,7 +24,7 @@ func newTestRouter(t *testing.T) *Router {
 		"coder":   {Description: "Code specialist", Workspace: "coder"},
 	}
 
-	reg := registry.New(s, agents, config.DefaultsConfig{}, filepath.Join(dir, "agents"))
+	reg := registry.New(s, agents, config.DefaultsConfig{}, filepath.Join(dir, "agents"), nil)
 	_ = reg.Sync()
 
 	return New(reg, config.RouterConfig{DefaultAgent: "general"})

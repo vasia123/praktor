@@ -37,7 +37,7 @@ func newTestRegistry(t *testing.T) (*Registry, *store.Store) {
 		Model: "claude-sonnet-4-5-20250929",
 	}
 
-	reg := New(s, agents, cfg, basePath)
+	reg := New(s, agents, cfg, basePath, nil)
 	return reg, s
 }
 

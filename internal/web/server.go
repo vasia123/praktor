@@ -14,6 +14,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
+
 	"github.com/mtzanidakis/praktor/internal/agent"
 	"github.com/mtzanidakis/praktor/internal/config"
 	"github.com/mtzanidakis/praktor/internal/natsbus"
@@ -33,6 +35,17 @@ const (
 	sessionMaxAge     = 30 * 24 * time.Hour // 30 days
 )
 
+type contextKey string
+
+const userContextKey contextKey = "user"
+
+type SessionData struct {
+	UserID    string
+	Username  string
+	IsAdmin   bool
+	ExpiresAt time.Time
+}
+
 type Server struct {
 	store      *store.Store
 	bus        *natsbus.Bus
@@ -48,7 +61,7 @@ type Server struct {
 	startedAt  time.Time
 
 	sessionMu sync.Mutex
-	sessions  map[string]time.Time // token → expiry
+	sessions  map[string]*SessionData // token → session
 }
 
 func NewServer(s *store.Store, bus *natsbus.Bus, orch *agent.Orchestrator, reg *registry.Registry, rtr *router.Router, swarmCoord *swarm.Coordinator, cfg config.WebConfig, v *vault.Vault, version string) *Server {
@@ -64,7 +77,7 @@ func NewServer(s *store.Store, bus *natsbus.Bus, orch *agent.Orchestrator, reg *
 		cfg:        cfg,
 		version:    version,
 		startedAt:  time.Now(),
-		sessions:   make(map[string]time.Time),
+		sessions:   make(map[string]*SessionData),
 	}
 }
 
@@ -129,15 +142,20 @@ func (s *Server) withMiddleware(next http.Handler) http.Handler {
 		}
 
 		// Session/auth for API routes (except public auth endpoints)
-		if strings.HasPrefix(r.URL.Path, "/api/") && s.cfg.Auth != "" {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
 			// Public endpoints: login and auth check
 			if r.URL.Path == "/api/login" || r.URL.Path == "/api/auth/check" {
 				next.ServeHTTP(w, r)
 				return
 			}
 
-			if !s.checkAuth(w, r) {
-				return
+			// Auth required if web.auth is set OR users exist in DB
+			if s.cfg.Auth != "" || s.hasUsers() {
+				authedReq, ok := s.checkAuth(w, r)
+				if !ok {
+					return
+				}
+				r = authedReq
 			}
 		}
 
@@ -145,18 +163,18 @@ func (s *Server) withMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// checkAuth validates session cookie or Basic Auth. Returns true if authenticated.
-func (s *Server) checkAuth(w http.ResponseWriter, r *http.Request) bool {
+// checkAuth validates session cookie or Basic Auth. Returns the request with user context if authenticated.
+func (s *Server) checkAuth(w http.ResponseWriter, r *http.Request) (*http.Request, bool) {
 	// Check session cookie first
 	if cookie, err := r.Cookie(sessionCookieName); err == nil {
 		s.sessionMu.Lock()
-		expiry, ok := s.sessions[cookie.Value]
-		if ok && time.Now().Before(expiry) {
+		sess, ok := s.sessions[cookie.Value]
+		if ok && time.Now().Before(sess.ExpiresAt) {
 			// Refresh session expiry
-			s.sessions[cookie.Value] = time.Now().Add(sessionMaxAge)
+			sess.ExpiresAt = time.Now().Add(sessionMaxAge)
 			s.sessionMu.Unlock()
 			s.setSessionCookie(w, cookie.Value)
-			return true
+			return r.WithContext(context.WithValue(r.Context(), userContextKey, sess)), true
 		}
 		// Expired or unknown — clean up
 		if ok {
@@ -166,23 +184,56 @@ func (s *Server) checkAuth(w http.ResponseWriter, r *http.Request) bool {
 	}
 
 	// Fall back to Basic Auth (for programmatic API access)
-	if _, pass, ok := r.BasicAuth(); ok && pass == s.cfg.Auth {
-		return true
+	if user, pass, ok := r.BasicAuth(); ok {
+		// Try username/password login against DB
+		if sess := s.authenticateUser(user, pass); sess != nil {
+			return r.WithContext(context.WithValue(r.Context(), userContextKey, sess)), true
+		}
+		// Fallback: legacy web.auth password
+		if pass == s.cfg.Auth && s.cfg.Auth != "" {
+			adminSess := &SessionData{UserID: "", Username: "admin", IsAdmin: true}
+			return r.WithContext(context.WithValue(r.Context(), userContextKey, adminSess)), true
+		}
 	}
 
 	http.Error(w, "Unauthorized", http.StatusUnauthorized)
-	return false
+	return r, false
 }
 
-func (s *Server) createSession() (string, error) {
+// authenticateUser checks username/password against the users DB.
+func (s *Server) authenticateUser(username, password string) *SessionData {
+	u, err := s.store.GetUserByUsername(username)
+	if err != nil || u == nil || u.Password == "" {
+		return nil
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(u.Password), []byte(password)); err != nil {
+		return nil
+	}
+	return &SessionData{
+		UserID:   u.ID,
+		Username: u.Username,
+		IsAdmin:  u.IsAdmin,
+	}
+}
+
+// getSession returns the session data from request context, or nil.
+func getSession(r *http.Request) *SessionData {
+	if sess, ok := r.Context().Value(userContextKey).(*SessionData); ok {
+		return sess
+	}
+	return nil
+}
+
+func (s *Server) createSession(data *SessionData) (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
 	token := hex.EncodeToString(b)
+	data.ExpiresAt = time.Now().Add(sessionMaxAge)
 
 	s.sessionMu.Lock()
-	s.sessions[token] = time.Now().Add(sessionMaxAge)
+	s.sessions[token] = data
 	s.sessionMu.Unlock()
 
 	return token, nil
@@ -200,12 +251,13 @@ func (s *Server) setSessionCookie(w http.ResponseWriter, token string) {
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
-	if s.cfg.Auth == "" {
+	if s.cfg.Auth == "" && !s.hasUsers() {
 		jsonResponse(w, map[string]string{"status": "ok"})
 		return
 	}
 
 	var body struct {
+		Username string `json:"username"`
 		Password string `json:"password"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -213,19 +265,36 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if body.Password != s.cfg.Auth {
-		jsonError(w, "invalid password", http.StatusUnauthorized)
+	var sessData *SessionData
+
+	// Try username/password auth against DB users
+	if body.Username != "" {
+		sessData = s.authenticateUser(body.Username, body.Password)
+	}
+
+	// Fallback to legacy web.auth password
+	if sessData == nil && s.cfg.Auth != "" && body.Password == s.cfg.Auth {
+		sessData = &SessionData{UserID: "", Username: "admin", IsAdmin: true}
+	}
+
+	if sessData == nil {
+		jsonError(w, "invalid credentials", http.StatusUnauthorized)
 		return
 	}
 
-	token, err := s.createSession()
+	token, err := s.createSession(sessData)
 	if err != nil {
 		jsonError(w, "session creation failed", http.StatusInternalServerError)
 		return
 	}
 
 	s.setSessionCookie(w, token)
-	jsonResponse(w, map[string]string{"status": "ok"})
+	jsonResponse(w, map[string]any{
+		"status":   "ok",
+		"user_id":  sessData.UserID,
+		"username": sessData.Username,
+		"is_admin": sessData.IsAdmin,
+	})
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -248,8 +317,8 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAuthCheck(w http.ResponseWriter, r *http.Request) {
-	// No auth configured — tell the UI to skip login
-	if s.cfg.Auth == "" {
+	// No auth configured and no users — tell the UI to skip login
+	if s.cfg.Auth == "" && !s.hasUsers() {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -257,12 +326,17 @@ func (s *Server) handleAuthCheck(w http.ResponseWriter, r *http.Request) {
 	// Check session cookie
 	if cookie, err := r.Cookie(sessionCookieName); err == nil {
 		s.sessionMu.Lock()
-		expiry, ok := s.sessions[cookie.Value]
-		if ok && time.Now().Before(expiry) {
-			s.sessions[cookie.Value] = time.Now().Add(sessionMaxAge)
+		sess, ok := s.sessions[cookie.Value]
+		if ok && time.Now().Before(sess.ExpiresAt) {
+			sess.ExpiresAt = time.Now().Add(sessionMaxAge)
 			s.sessionMu.Unlock()
 			s.setSessionCookie(w, cookie.Value)
-			jsonResponse(w, map[string]string{"status": "ok"})
+			jsonResponse(w, map[string]any{
+				"status":   "ok",
+				"user_id":  sess.UserID,
+				"username": sess.Username,
+				"is_admin": sess.IsAdmin,
+			})
 			return
 		}
 		if ok {
@@ -272,6 +346,20 @@ func (s *Server) handleAuthCheck(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.Error(w, "Unauthorized", http.StatusUnauthorized)
+}
+
+// hasUsers returns true if there are any users in the DB with passwords set.
+func (s *Server) hasUsers() bool {
+	users, err := s.store.ListUsers()
+	if err != nil {
+		return false
+	}
+	for _, u := range users {
+		if u.Password != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) subscribeEvents() {

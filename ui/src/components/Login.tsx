@@ -1,10 +1,11 @@
 import { useState, FormEvent } from 'react';
 
 interface LoginProps {
-  onLogin: () => void;
+  onLogin: (user: { user_id: string; username: string; is_admin: boolean }) => void;
 }
 
 export default function Login({ onLogin }: LoginProps) {
+  const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
@@ -18,13 +19,18 @@ export default function Login({ onLogin }: LoginProps) {
       const res = await fetch('/api/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password }),
+        body: JSON.stringify({ username, password }),
       });
 
       if (res.ok) {
-        onLogin();
+        const data = await res.json();
+        onLogin({
+          user_id: data.user_id || '',
+          username: data.username || username || 'admin',
+          is_admin: data.is_admin ?? true,
+        });
       } else {
-        setError('Invalid password');
+        setError('Invalid credentials');
         setPassword('');
       }
     } catch {
@@ -76,11 +82,29 @@ export default function Login({ onLogin }: LoginProps) {
         </div>
 
         <input
+          type="text"
+          value={username}
+          onChange={(e) => setUsername(e.target.value)}
+          placeholder="Username"
+          autoFocus
+          autoComplete="username"
+          style={{
+            padding: '10px 12px',
+            borderRadius: 8,
+            border: '1px solid var(--border)',
+            background: 'var(--bg-primary)',
+            color: 'var(--text-primary)',
+            fontSize: 14,
+            outline: 'none',
+          }}
+        />
+
+        <input
           type="password"
           value={password}
           onChange={(e) => setPassword(e.target.value)}
           placeholder="Password"
-          autoFocus
+          autoComplete="current-password"
           style={{
             padding: '10px 12px',
             borderRadius: 8,

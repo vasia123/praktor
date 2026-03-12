@@ -3,9 +3,11 @@ package agent
 import "sync"
 
 type QueuedMessage struct {
-	AgentID string
-	Text    string
-	Meta    map[string]string
+	AgentID     string
+	ContainerID string // per-user container ID (e.g. "user-123")
+	UserID      string
+	Text        string
+	Meta        map[string]string
 }
 
 type AgentQueue struct {

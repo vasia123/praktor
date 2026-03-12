@@ -191,7 +191,12 @@ func (s *Server) checkAuth(w http.ResponseWriter, r *http.Request) (*http.Reques
 		}
 		// Fallback: legacy web.auth password
 		if pass == s.cfg.Auth && s.cfg.Auth != "" {
-			adminSess := &SessionData{UserID: "", Username: "admin", IsAdmin: true}
+			var adminSess *SessionData
+			if adminUser := s.findAdminUser(); adminUser != nil {
+				adminSess = &SessionData{UserID: adminUser.ID, Username: adminUser.Username, IsAdmin: true}
+			} else {
+				adminSess = &SessionData{UserID: "", Username: "admin", IsAdmin: true}
+			}
 			return r.WithContext(context.WithValue(r.Context(), userContextKey, adminSess)), true
 		}
 	}
@@ -274,7 +279,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	// Fallback to legacy web.auth password
 	if sessData == nil && s.cfg.Auth != "" && body.Password == s.cfg.Auth {
-		sessData = &SessionData{UserID: "", Username: "admin", IsAdmin: true}
+		if adminUser := s.findAdminUser(); adminUser != nil {
+			sessData = &SessionData{UserID: adminUser.ID, Username: adminUser.Username, IsAdmin: true}
+		} else {
+			sessData = &SessionData{UserID: "", Username: "admin", IsAdmin: true}
+		}
 	}
 
 	if sessData == nil {
@@ -348,18 +357,24 @@ func (s *Server) handleAuthCheck(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "Unauthorized", http.StatusUnauthorized)
 }
 
-// hasUsers returns true if there are any users in the DB with passwords set.
+// hasUsers returns true if there are any users in the DB.
 func (s *Server) hasUsers() bool {
+	count, err := s.store.UserCount()
+	return err == nil && count > 0
+}
+
+// findAdminUser returns the first admin user from DB, or the first user if no admin exists.
+func (s *Server) findAdminUser() *store.User {
 	users, err := s.store.ListUsers()
-	if err != nil {
-		return false
+	if err != nil || len(users) == 0 {
+		return nil
 	}
 	for _, u := range users {
-		if u.Password != "" {
-			return true
+		if u.IsAdmin {
+			return &u
 		}
 	}
-	return false
+	return &users[0]
 }
 
 func (s *Server) subscribeEvents() {

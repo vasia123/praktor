@@ -36,9 +36,15 @@ function MyAgents() {
   const [form, setForm] = useState({ name: '', description: '', model: '', system_prompt: '' });
   const [saving, setSaving] = useState(false);
 
+  const [noAccess, setNoAccess] = useState(false);
+
   const fetchAgents = useCallback(() => {
     fetch('/api/user/agents')
       .then((res) => {
+        if (res.status === 401) {
+          setNoAccess(true);
+          return [];
+        }
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return res.json();
       })
@@ -180,7 +186,13 @@ function MyAgents() {
         ))}
       </div>
 
-      {agents.length === 0 && !error && (
+      {noAccess && (
+        <div style={{ ...card, color: 'var(--text-secondary)', marginTop: 16 }}>
+          Log in with a user account to manage agents.
+        </div>
+      )}
+
+      {agents.length === 0 && !error && !noAccess && (
         <div style={{ color: 'var(--text-tertiary)', fontSize: 16, marginTop: 16 }}>
           No agents yet. Create one to get started.
         </div>

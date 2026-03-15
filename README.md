@@ -4,17 +4,11 @@
 
 # Praktor
 
-Personal AI agent assistant. A lightweight, self-hosted alternative to [OpenClaw](https://github.com/openclaw/openclaw) focused on Telegram and Claude Code. Define named agents with distinct roles and models, message them from Telegram, and monitor everything from Mission Control.
+Personal AI agent assistant. A single Go binary that receives messages from Telegram, routes them to named agents running Claude Code in isolated Docker containers, and serves a real-time Mission Control web UI. Self-hosted, single-binary deployment via Docker Compose.
 
-```
-Telegram ──> Go Gateway ──> Router ──> Embedded NATS ──> Agent Containers (Docker)
-                 |                                            |
-             SQLite DB                                Claude Code SDK
-                 |
-       Mission Control (React SPA)
-```
-
-A single Go binary that orchestrates the full loop: receives messages from Telegram, routes them to the right agent, spins up isolated Docker containers running Claude Code, streams responses back, and serves a real-time Mission Control web UI.
+<p align="center">
+  <img src="docs/architecture.svg" alt="Architecture diagram" width="800" />
+</p>
 
 ## Features
 

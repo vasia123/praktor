@@ -39,3 +39,25 @@ func BuildAgentImage(ctx context.Context, docker *client.Client, imageName strin
 	slog.Info("agent image built", "image", imageName)
 	return nil
 }
+
+// BuildAgentImageFromRepo builds the agent image using a remote Git repository as build context.
+// Docker daemon clones the repo and builds using Dockerfile.agent from the repo root.
+func BuildAgentImageFromRepo(ctx context.Context, docker *client.Client, imageName, repoURL string) error {
+	resp, err := docker.ImageBuild(ctx, nil, build.ImageBuildOptions{
+		RemoteContext: repoURL,
+		Dockerfile:   "Dockerfile.agent",
+		Tags:         []string{imageName},
+		Remove:       true,
+	})
+	if err != nil {
+		return fmt.Errorf("build image from repo: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		slog.Warn("error reading build output", "error", err)
+	}
+
+	slog.Info("agent image built from repo", "image", imageName, "repo", repoURL)
+	return nil
+}

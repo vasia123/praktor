@@ -175,6 +175,10 @@ func (m *Manager) StartAgent(ctx context.Context, opts AgentOpts) (*ContainerInf
 		image = m.cfg.Image
 	}
 
+	if err := m.ensureImage(ctx, image); err != nil {
+		return nil, fmt.Errorf("ensure image: %w", err)
+	}
+
 	containerCfg := &dockercontainer.Config{
 		Image:  image,
 		Env:    env,
@@ -413,6 +417,20 @@ func (m *Manager) CleanupStale(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// ensureImage checks if the agent image exists locally and builds it from the
+// configured Git repository if missing.
+func (m *Manager) ensureImage(ctx context.Context, image string) error {
+	_, err := m.docker.ImageInspect(ctx, image)
+	if err == nil {
+		return nil
+	}
+	if m.cfg.AgentBuildRepo == "" {
+		return fmt.Errorf("image %s not found and agent_build_repo not configured", image)
+	}
+	slog.Info("agent image not found, building from repo", "image", image, "repo", m.cfg.AgentBuildRepo)
+	return BuildAgentImageFromRepo(ctx, m.docker, image, m.cfg.AgentBuildRepo)
 }
 
 func (m *Manager) BuildImage(ctx context.Context) error {

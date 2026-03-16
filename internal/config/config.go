@@ -32,6 +32,7 @@ type TelegramConfig struct {
 
 type DefaultsConfig struct {
 	Image           string        `yaml:"image"`
+	AgentBuildRepo  string        `yaml:"agent_build_repo"`
 	Model           string        `yaml:"model"`
 	MaxRunning   int           `yaml:"max_running"`
 	IdleTimeout     time.Duration `yaml:"idle_timeout"`
@@ -187,5 +188,8 @@ func applyEnv(cfg *Config) {
 	}
 	if v := os.Getenv("PRAKTOR_VAULT_PASSPHRASE"); v != "" {
 		cfg.Vault.Passphrase = v
+	}
+	if v := os.Getenv("PRAKTOR_AGENT_BUILD_REPO"); v != "" {
+		cfg.Defaults.AgentBuildRepo = v
 	}
 }

@@ -255,6 +255,9 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		ContextMode: body.ContextMode,
 		Status:      status,
 	}
+	if sess := getSession(r); sess != nil && sess.UserID != "" {
+		t.UserID = sess.UserID
+	}
 	if t.ContextMode == "" {
 		t.ContextMode = "isolated"
 	}

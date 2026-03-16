@@ -100,7 +100,10 @@ func (s *Scheduler) execute(ctx context.Context, task store.ScheduledTask) {
 		"sender":  "scheduler",
 		"task_id": task.ID,
 	}
-	if s.mainChatID != 0 {
+	if task.UserID != "" {
+		meta["chat_id"] = task.UserID
+		meta["user_id"] = task.UserID
+	} else if s.mainChatID != 0 {
 		meta["chat_id"] = strconv.FormatInt(s.mainChatID, 10)
 	}
 

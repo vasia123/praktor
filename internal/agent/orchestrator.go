@@ -43,6 +43,7 @@ type Orchestrator struct {
 	mu         sync.RWMutex
 	listeners        []OutputListener
 	fileListeners    []FileListener
+	taskListeners    []TaskCreatedListener
 	telegramHandler  TelegramActionHandler
 	listenerMu       sync.RWMutex
 	swarmCoord SwarmCoordinator
@@ -50,6 +51,7 @@ type Orchestrator struct {
 
 type OutputListener func(agentID, content string, meta map[string]string)
 type FileListener func(agentID string, chatID int64, data []byte, name, mimeType, caption string)
+type TaskCreatedListener func(task store.ScheduledTask)
 
 // TelegramAction represents a Telegram API action requested by an agent via IPC.
 type TelegramAction struct {
@@ -145,6 +147,12 @@ func (o *Orchestrator) OnFile(listener FileListener) {
 	o.listenerMu.Lock()
 	defer o.listenerMu.Unlock()
 	o.fileListeners = append(o.fileListeners, listener)
+}
+
+func (o *Orchestrator) OnTaskCreated(listener TaskCreatedListener) {
+	o.listenerMu.Lock()
+	defer o.listenerMu.Unlock()
+	o.taskListeners = append(o.taskListeners, listener)
 }
 
 // ContainerAgentID returns the container/NATS agent ID for a given user.
@@ -562,6 +570,12 @@ func (o *Orchestrator) ipcCreateTask(msg *nats.Msg, agentID string, payload json
 		return
 	}
 
+	// Extract user ID from container agent ID (format: "user-{userID}")
+	userID := ""
+	if strings.HasPrefix(agentID, "user-") {
+		userID = strings.TrimPrefix(agentID, "user-")
+	}
+
 	t := &store.ScheduledTask{
 		ID:          uuid.New().String(),
 		AgentID:     agentID,
@@ -570,6 +584,7 @@ func (o *Orchestrator) ipcCreateTask(msg *nats.Msg, agentID string, payload json
 		Prompt:      req.Prompt,
 		ContextMode: "isolated",
 		Status:      "active",
+		UserID:      userID,
 		NextRunAt:   schedule.CalculateNextRun(normalized),
 	}
 
@@ -578,8 +593,18 @@ func (o *Orchestrator) ipcCreateTask(msg *nats.Msg, agentID string, payload json
 		return
 	}
 
-	slog.Info("task created via IPC", "id", t.ID, "name", t.Name, "agent", agentID)
+	slog.Info("task created via IPC", "id", t.ID, "name", t.Name, "agent", agentID, "user_id", userID)
 	o.respondIPC(msg, map[string]any{"ok": true, "id": t.ID})
+
+	// Notify listeners about recurring task creation
+	s, _ := schedule.ParseSchedule(normalized)
+	if s != nil && s.Kind != "once" {
+		o.listenerMu.RLock()
+		for _, l := range o.taskListeners {
+			l(*t)
+		}
+		o.listenerMu.RUnlock()
+	}
 }
 
 func (o *Orchestrator) ipcListTasks(msg *nats.Msg, agentID string) {

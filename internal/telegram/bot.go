@@ -18,6 +18,7 @@ import (
 	"github.com/mtzanidakis/praktor/internal/natsbus"
 	"github.com/mtzanidakis/praktor/internal/registry"
 	"github.com/mtzanidakis/praktor/internal/router"
+	"github.com/mtzanidakis/praktor/internal/schedule"
 	"github.com/mtzanidakis/praktor/internal/store"
 	"github.com/mtzanidakis/praktor/internal/swarm"
 	"github.com/mymmrac/telego"
@@ -82,6 +83,7 @@ func NewBot(cfg config.TelegramConfig, orch *agent.Orchestrator, rtr *router.Rou
 			{Command: "start", Description: "Say hello to an agent"},
 			{Command: "stop", Description: "Abort the active agent run"},
 			{Command: "reset", Description: "Reset conversation session"},
+			{Command: "tasks", Description: "List and manage scheduled tasks"},
 			{Command: "nix", Description: "Manage nix packages in agent container"},
 		},
 	})
@@ -120,7 +122,16 @@ func NewBot(cfg config.TelegramConfig, orch *agent.Orchestrator, rtr *router.Rou
 		if agentID != rtr.DefaultAgent() {
 			attributed = fmt.Sprintf("_%s:_ %s", agentID, content)
 		}
-		if err := b.sendAgentMessage(context.Background(), chatID, attributed, agentID); err != nil {
+
+		// For scheduler results, add "My tasks" inline button
+		if meta != nil && meta["sender"] == "scheduler" {
+			keyboard := tu.InlineKeyboard(tu.InlineKeyboardRow(
+				tu.InlineKeyboardButton("📋 Мои задачи").WithCallbackData("tasks:list"),
+			))
+			if err := b.sendMessageWithKeyboard(context.Background(), chatID, attributed, keyboard); err != nil {
+				slog.Error("failed to send telegram message", "chat", chatID, "error", err)
+			}
+		} else if err := b.sendAgentMessage(context.Background(), chatID, attributed, agentID); err != nil {
 			slog.Error("failed to send telegram message", "chat", chatID, "error", err)
 		}
 	})
@@ -142,6 +153,25 @@ func NewBot(cfg config.TelegramConfig, orch *agent.Orchestrator, rtr *router.Rou
 	// Register Telegram action handler for agent IPC
 	orch.OnTelegramAction(func(ctx context.Context, action agent.TelegramAction) agent.TelegramActionResult {
 		return b.handleTelegramAction(ctx, action)
+	})
+
+	// Notify user when a recurring task is created by an agent
+	orch.OnTaskCreated(func(task store.ScheduledTask) {
+		if task.UserID == "" {
+			return
+		}
+		chatID, err := strconv.ParseInt(task.UserID, 10, 64)
+		if err != nil {
+			return
+		}
+		text := fmt.Sprintf("⏰ Создана задача: *%s*\nРасписание: `%s`\nАгент: `%s`",
+			task.Name, schedule.FormatSchedule(task.Schedule), task.AgentID)
+		keyboard := tu.InlineKeyboard(tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("📋 Мои задачи").WithCallbackData("tasks:list"),
+		))
+		if err := b.sendMessageWithKeyboard(context.Background(), chatID, text, keyboard); err != nil {
+			slog.Error("failed to send task creation notification", "chat", chatID, "error", err)
+		}
 	})
 
 	// Subscribe to swarm events for result delivery
@@ -222,6 +252,14 @@ func (b *Bot) Start(ctx context.Context) error {
 		if !b.allowedUser(message) {
 			return nil
 		}
+		b.cmdTasks(ctx, message.Chat.ID, message.From.ID)
+		return nil
+	}, th.CommandEqual("tasks"))
+
+	handler.HandleMessage(func(hctx *th.Context, message telego.Message) error {
+		if !b.allowedUser(message) {
+			return nil
+		}
 		_, _, payload := tu.ParseCommandPayload(message.Text)
 		b.cmdPkg(ctx, message.Chat.ID, payload)
 		return nil
@@ -253,6 +291,12 @@ func (b *Bot) Start(ctx context.Context) error {
 		b.cmdProject(ctx, message, payload)
 		return nil
 	}, th.CommandEqual("project"))
+
+	// Callback query handler for inline buttons
+	handler.HandleCallbackQuery(func(hctx *th.Context, query telego.CallbackQuery) error {
+		b.handleCallbackQuery(ctx, query)
+		return nil
+	})
 
 	// Catch-all for regular messages
 	handler.HandleMessage(func(hctx *th.Context, message telego.Message) error {
@@ -838,6 +882,7 @@ func (b *Bot) cmdCommands(ctx context.Context, chatID int64) {
 		"  /agents — List your agents\n" +
 		"  /newagent <name> <description> — Create a new agent\n" +
 		"  /delagent <name> — Delete an agent\n" +
+		"  /tasks — List and manage scheduled tasks\n" +
 		"  /project \\[name] — List or switch projects\n" +
 		"  /commands — Show available commands\n" +
 		"  /start \\[agent] — Say hello to an agent\n" +
@@ -1615,6 +1660,164 @@ func (b *Bot) handleTelegramAction(ctx context.Context, action agent.TelegramAct
 
 	default:
 		return agent.TelegramActionResult{Error: "unknown action type: " + action.Type}
+	}
+}
+
+// sendMessageWithKeyboard sends a message with an inline keyboard.
+func (b *Bot) sendMessageWithKeyboard(ctx context.Context, chatID int64, text string, keyboard *telego.InlineKeyboardMarkup) error {
+	text = toTelegramMarkdown(text)
+	chunks := chunkMessage(text, 4096)
+	for i, chunk := range chunks {
+		msg := tu.Message(tu.ID(chatID), chunk)
+		msg.ParseMode = telego.ModeMarkdown
+		// Only attach keyboard to the last chunk
+		if i == len(chunks)-1 {
+			msg.ReplyMarkup = keyboard
+		}
+		_, err := b.bot.SendMessage(ctx, msg)
+		if err != nil {
+			msg.ParseMode = ""
+			_, err = b.bot.SendMessage(ctx, msg)
+		}
+		if err != nil {
+			return fmt.Errorf("send message with keyboard: %w", err)
+		}
+	}
+	return nil
+}
+
+// cmdTasks shows the user's scheduled tasks with management buttons.
+func (b *Bot) cmdTasks(ctx context.Context, chatID int64, telegramUserID int64) {
+	userID := strconv.FormatInt(telegramUserID, 10)
+	b.sendTaskList(ctx, chatID, userID)
+}
+
+// sendTaskList sends a formatted task list with inline buttons.
+func (b *Bot) sendTaskList(ctx context.Context, chatID int64, userID string) {
+	tasks, err := b.store.ListTasksByUserID(userID)
+	if err != nil {
+		_ = b.SendMessage(ctx, chatID, "Failed to load tasks.")
+		return
+	}
+
+	// Filter to active/paused tasks
+	var active []store.ScheduledTask
+	for _, t := range tasks {
+		if t.Status == "active" || t.Status == "paused" {
+			active = append(active, t)
+		}
+	}
+
+	if len(active) == 0 {
+		_ = b.SendMessage(ctx, chatID, "📋 У вас нет активных задач.")
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("📋 *Мои задачи* (%d)\n\n", len(active)))
+	for i, t := range active {
+		status := "⏰"
+		if t.Status == "paused" {
+			status = "⏸"
+		}
+		sb.WriteString(fmt.Sprintf("%d. *%s* — %s %s\n", i+1, t.Name, status, schedule.FormatSchedule(t.Schedule)))
+	}
+
+	// Build inline keyboard: pause/resume + delete rows
+	var rows [][]telego.InlineKeyboardButton
+	var pauseRow []telego.InlineKeyboardButton
+	var deleteRow []telego.InlineKeyboardButton
+	for i, t := range active {
+		label := fmt.Sprintf("⏸ %d", i+1)
+		data := fmt.Sprintf("tasks:pause:%s", t.ID)
+		if t.Status == "paused" {
+			label = fmt.Sprintf("▶️ %d", i+1)
+		}
+		pauseRow = append(pauseRow, tu.InlineKeyboardButton(label).WithCallbackData(data))
+		deleteRow = append(deleteRow, tu.InlineKeyboardButton(fmt.Sprintf("🗑 %d", i+1)).WithCallbackData(fmt.Sprintf("tasks:delete:%s", t.ID)))
+
+		// Max 8 buttons per row for Telegram
+		if len(pauseRow) >= 4 {
+			rows = append(rows, pauseRow, deleteRow)
+			pauseRow = nil
+			deleteRow = nil
+		}
+	}
+	if len(pauseRow) > 0 {
+		rows = append(rows, pauseRow, deleteRow)
+	}
+
+	keyboard := &telego.InlineKeyboardMarkup{InlineKeyboard: rows}
+	if err := b.sendMessageWithKeyboard(ctx, chatID, sb.String(), keyboard); err != nil {
+		slog.Error("failed to send task list", "error", err)
+	}
+}
+
+// handleCallbackQuery processes inline button presses.
+func (b *Bot) handleCallbackQuery(ctx context.Context, query telego.CallbackQuery) {
+	data := query.Data
+	chatID := query.Message.GetChat().ID
+
+	// Answer the callback to remove the loading indicator
+	_ = b.bot.AnswerCallbackQuery(ctx, &telego.AnswerCallbackQueryParams{
+		CallbackQueryID: query.ID,
+	})
+
+	userID := strconv.FormatInt(query.From.ID, 10)
+
+	switch {
+	case data == "tasks:list":
+		b.sendTaskList(ctx, chatID, userID)
+
+	case strings.HasPrefix(data, "tasks:pause:"):
+		taskID := strings.TrimPrefix(data, "tasks:pause:")
+		task, err := b.store.GetTask(taskID)
+		if err != nil || task == nil {
+			_ = b.SendMessage(ctx, chatID, "Задача не найдена.")
+			return
+		}
+		// Verify ownership
+		if task.UserID != userID {
+			_ = b.SendMessage(ctx, chatID, "Это не ваша задача.")
+			return
+		}
+		newStatus := "paused"
+		action := "⏸ Задача приостановлена"
+		if task.Status == "paused" {
+			newStatus = "active"
+			action = "▶️ Задача возобновлена"
+		}
+		if err := b.store.UpdateTaskStatus(taskID, newStatus); err != nil {
+			_ = b.SendMessage(ctx, chatID, "Ошибка обновления задачи.")
+			return
+		}
+		// If resuming, recalculate next run
+		if newStatus == "active" {
+			nextRun := schedule.CalculateNextRun(task.Schedule)
+			if nextRun != nil {
+				_ = b.store.UpdateTaskRun(taskID, task.LastStatus, task.LastError, nextRun)
+			}
+		}
+		_ = b.SendMessage(ctx, chatID, fmt.Sprintf("%s: *%s*", action, task.Name))
+		b.sendTaskList(ctx, chatID, userID)
+
+	case strings.HasPrefix(data, "tasks:delete:"):
+		taskID := strings.TrimPrefix(data, "tasks:delete:")
+		task, err := b.store.GetTask(taskID)
+		if err != nil || task == nil {
+			_ = b.SendMessage(ctx, chatID, "Задача не найдена.")
+			return
+		}
+		if task.UserID != userID {
+			_ = b.SendMessage(ctx, chatID, "Это не ваша задача.")
+			return
+		}
+		if err := b.store.DeleteTask(taskID); err != nil {
+			_ = b.SendMessage(ctx, chatID, "Ошибка удаления задачи.")
+			return
+		}
+		_ = b.SendMessage(ctx, chatID, fmt.Sprintf("🗑 Задача удалена: *%s*", task.Name))
+		b.sendTaskList(ctx, chatID, userID)
 	}
 }
 

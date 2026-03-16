@@ -167,6 +167,8 @@ func (s *Store) migrate() error {
 		`ALTER TABLE agents ADD COLUMN user_id TEXT DEFAULT ''`,
 		`ALTER TABLE agents ADD COLUMN system_prompt TEXT DEFAULT ''`,
 		`ALTER TABLE scheduled_tasks ADD COLUMN user_id TEXT DEFAULT ''`,
+		`ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'approved'`,
+		`ALTER TABLE users ADD COLUMN telegram_id INTEGER DEFAULT 0`,
 	} {
 		_, _ = s.db.Exec(stmt)
 	}

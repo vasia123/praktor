@@ -184,6 +184,25 @@ func NewBot(cfg config.TelegramConfig, orch *agent.Orchestrator, rtr *router.Rou
 		}
 	}
 
+	// Subscribe to user approval events (from web API)
+	if bus != nil {
+		client, cerr := natsbus.NewClient(bus)
+		if cerr == nil {
+			_, _ = client.Subscribe(natsbus.TopicEventsUserApproved, func(msg *nats.Msg) {
+				var evt struct {
+					UserID     string `json:"user_id"`
+					TelegramID int64  `json:"telegram_id"`
+				}
+				if err := json.Unmarshal(msg.Data, &evt); err != nil {
+					return
+				}
+				if evt.TelegramID > 0 {
+					_ = b.SendMessage(context.Background(), evt.TelegramID, "Your access has been approved! Use /start to begin.")
+				}
+			})
+		}
+	}
+
 	return b, nil
 }
 
@@ -205,10 +224,8 @@ func (b *Bot) Start(ctx context.Context) error {
 	b.handler = handler
 
 	// Command handlers — registered before the catch-all so they match first
+	// /start is special — no allowedUser gate; handles self-registration
 	handler.HandleMessage(func(hctx *th.Context, message telego.Message) error {
-		if !b.allowedUser(message) {
-			return nil
-		}
 		_, _, payload := tu.ParseCommandPayload(message.Text)
 		b.cmdStart(ctx, message, payload)
 		return nil
@@ -321,12 +338,26 @@ func (b *Bot) Stop() {
 }
 
 func (b *Bot) handleMessage(ctx context.Context, msg telego.Message) {
-	if !b.allowedUser(msg) {
+	if msg.From == nil {
 		return
 	}
 
 	chatID := msg.Chat.ID
 	userID := msg.From.ID
+
+	// DB-based access control
+	status := b.getUserStatus(userID)
+	switch status {
+	case "":
+		_ = b.SendMessage(ctx, chatID, "You don't have access. Use /start to request access.")
+		return
+	case "pending":
+		_ = b.SendMessage(ctx, chatID, "Your access request is still pending. Please wait for admin approval.")
+		return
+	case "blocked":
+		return // silent drop
+	}
+	// status == "approved" → continue
 
 	// Extract text from message or caption
 	text := msg.Text
@@ -786,16 +817,27 @@ func (b *Bot) parseSwarmSpec(spec string) ([]swarm.SwarmAgent, []swarm.Synapse, 
 
 // allowedUser checks whether the message sender is in the allow list.
 func (b *Bot) allowedUser(msg telego.Message) bool {
-	if len(b.cfg.AllowFrom) == 0 {
-		return true
+	if msg.From == nil {
+		return false
 	}
-	for _, id := range b.cfg.AllowFrom {
-		if id == msg.From.ID {
-			return true
-		}
+	user, err := b.store.GetUserByTelegramIDCompat(msg.From.ID)
+	if err != nil {
+		slog.Error("allowedUser DB lookup failed", "error", err)
+		return false
 	}
-	slog.Warn("unauthorized telegram user", "user_id", msg.From.ID, "chat_id", msg.Chat.ID)
-	return false
+	if user == nil {
+		return false
+	}
+	return user.Status == "approved"
+}
+
+// getUserStatus returns the user's status or "" if not found.
+func (b *Bot) getUserStatus(telegramID int64) string {
+	user, err := b.store.GetUserByTelegramIDCompat(telegramID)
+	if err != nil || user == nil {
+		return ""
+	}
+	return user.Status
 }
 
 // resolveAgent returns the agent ID from payload or falls back to the last agent for the chat.
@@ -810,7 +852,31 @@ func (b *Bot) resolveAgent(chatID int64, payload string) string {
 }
 
 func (b *Bot) cmdStart(ctx context.Context, msg telego.Message, payload string) {
+	if msg.From == nil {
+		return
+	}
 	chatID := msg.Chat.ID
+	telegramID := msg.From.ID
+
+	// Look up user in DB
+	user, _ := b.store.GetUserByTelegramIDCompat(telegramID)
+
+	if user == nil {
+		// Unknown user → auto-register as pending (or auto-admin if DB is empty)
+		b.registerNewUser(ctx, msg)
+		return
+	}
+
+	switch user.Status {
+	case "pending":
+		_ = b.SendMessage(ctx, chatID, "Your access request is still pending. An admin will review it shortly.")
+		return
+	case "blocked":
+		_ = b.SendMessage(ctx, chatID, "Your access has been revoked.")
+		return
+	}
+
+	// Approved user → existing agent-routing logic
 	agentID := ""
 	if f := strings.Fields(payload); len(f) > 0 {
 		agentID = strings.TrimPrefix(f[0], "@")
@@ -831,16 +897,14 @@ func (b *Bot) cmdStart(ctx context.Context, msg telego.Message, payload string) 
 		"msg_id":    strconv.Itoa(msg.MessageID),
 		"chat_type": string(msg.Chat.Type),
 	}
-	if msg.From != nil {
-		if msg.From.Username != "" {
-			meta["username"] = msg.From.Username
-		}
-		if msg.From.FirstName != "" {
-			meta["first_name"] = msg.From.FirstName
-		}
-		if msg.From.LastName != "" {
-			meta["last_name"] = msg.From.LastName
-		}
+	if msg.From.Username != "" {
+		meta["username"] = msg.From.Username
+	}
+	if msg.From.FirstName != "" {
+		meta["first_name"] = msg.From.FirstName
+	}
+	if msg.From.LastName != "" {
+		meta["last_name"] = msg.From.LastName
 	}
 	if msg.Chat.Title != "" {
 		meta["chat_title"] = msg.Chat.Title
@@ -848,6 +912,82 @@ func (b *Bot) cmdStart(ctx context.Context, msg telego.Message, payload string) 
 	if err := b.orch.HandleMessage(ctx, agentID, "Hello!", meta); err != nil {
 		slog.Error("handle start failed", "agent", agentID, "error", err)
 		_ = b.SendMessage(ctx, chatID, "Sorry, I encountered an error starting the conversation.")
+	}
+}
+
+// registerNewUser creates a new pending user or auto-approves as admin if DB is empty.
+func (b *Bot) registerNewUser(ctx context.Context, msg telego.Message) {
+	chatID := msg.Chat.ID
+	telegramID := msg.From.ID
+
+	displayName := msg.From.FirstName
+	if msg.From.LastName != "" {
+		displayName += " " + msg.From.LastName
+	}
+	username := msg.From.Username
+	if username == "" {
+		username = fmt.Sprintf("%d", telegramID)
+	}
+
+	id := fmt.Sprintf("%d", telegramID)
+	status := "pending"
+	isAdmin := false
+
+	// First-user bootstrap: if DB is empty and allow_from is empty, auto-approve as admin
+	userCount, _ := b.store.UserCount()
+	if userCount == 0 && len(b.cfg.AllowFrom) == 0 {
+		status = "approved"
+		isAdmin = true
+	}
+
+	u := &store.User{
+		ID:          id,
+		Username:    username,
+		DisplayName: displayName,
+		IsAdmin:     isAdmin,
+		Status:      status,
+		TelegramID:  telegramID,
+	}
+	if err := b.store.CreateUser(u); err != nil {
+		slog.Error("failed to register user", "telegram_id", telegramID, "error", err)
+		_ = b.SendMessage(ctx, chatID, "Sorry, something went wrong. Please try again later.")
+		return
+	}
+
+	if status == "approved" {
+		_ = b.SendMessage(ctx, chatID, "Welcome! You've been auto-approved as admin. Use /start again to begin.")
+		return
+	}
+
+	_ = b.SendMessage(ctx, chatID, "Your access request has been sent to an admin. Please wait for approval.")
+	b.notifyAdminNewUser(ctx, msg)
+}
+
+// notifyAdminNewUser sends a notification to main_chat_id with inline approve/block buttons.
+func (b *Bot) notifyAdminNewUser(ctx context.Context, msg telego.Message) {
+	if b.cfg.MainChatID == 0 {
+		return
+	}
+	telegramID := msg.From.ID
+	displayName := msg.From.FirstName
+	if msg.From.LastName != "" {
+		displayName += " " + msg.From.LastName
+	}
+	usernameStr := ""
+	if msg.From.Username != "" {
+		usernameStr = fmt.Sprintf(" (@%s)", msg.From.Username)
+	}
+
+	id := fmt.Sprintf("%d", telegramID)
+	text := fmt.Sprintf("New user request: *%s*%s\nTelegram ID: `%d`", displayName, usernameStr, telegramID)
+
+	keyboard := tu.InlineKeyboard(tu.InlineKeyboardRow(
+		tu.InlineKeyboardButton("Approve").WithCallbackData(fmt.Sprintf("user:approve:%s", id)),
+		tu.InlineKeyboardButton("Block").WithCallbackData(fmt.Sprintf("user:block:%s", id)),
+	))
+
+	if err := b.sendMessageWithKeyboard(ctx, b.cfg.MainChatID, text, keyboard); err != nil {
+		slog.Error("failed to notify admin about new user", "error", err)
 	}
 }
 
@@ -1818,6 +1958,45 @@ func (b *Bot) handleCallbackQuery(ctx context.Context, query telego.CallbackQuer
 		}
 		_ = b.SendMessage(ctx, chatID, fmt.Sprintf("🗑 Задача удалена: *%s*", task.Name))
 		b.sendTaskList(ctx, chatID, userID)
+
+	case strings.HasPrefix(data, "user:approve:"):
+		b.handleUserStatusCallback(ctx, query, strings.TrimPrefix(data, "user:approve:"), "approved")
+
+	case strings.HasPrefix(data, "user:block:"):
+		b.handleUserStatusCallback(ctx, query, strings.TrimPrefix(data, "user:block:"), "blocked")
+	}
+}
+
+func (b *Bot) handleUserStatusCallback(ctx context.Context, query telego.CallbackQuery, targetUserID, newStatus string) {
+	chatID := query.Message.GetChat().ID
+
+	// Only admins can approve/block
+	adminUser, _ := b.store.GetUserByTelegramIDCompat(query.From.ID)
+	if adminUser == nil || !adminUser.IsAdmin {
+		_ = b.SendMessage(ctx, chatID, "Only admins can manage user access.")
+		return
+	}
+
+	targetUser, err := b.store.GetUser(targetUserID)
+	if err != nil || targetUser == nil {
+		_ = b.SendMessage(ctx, chatID, "User not found.")
+		return
+	}
+
+	if err := b.store.UpdateUserStatus(targetUserID, newStatus); err != nil {
+		_ = b.SendMessage(ctx, chatID, "Failed to update user status.")
+		return
+	}
+
+	action := "approved"
+	if newStatus == "blocked" {
+		action = "blocked"
+	}
+	_ = b.SendMessage(ctx, chatID, fmt.Sprintf("User *%s* has been %s.", targetUser.DisplayName, action))
+
+	// Notify user if approved and they have a telegram ID
+	if newStatus == "approved" && targetUser.TelegramID > 0 {
+		_ = b.SendMessage(ctx, targetUser.TelegramID, "Your access has been approved! Use /start to begin.")
 	}
 }
 

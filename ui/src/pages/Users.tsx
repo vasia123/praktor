@@ -6,6 +6,8 @@ interface User {
   display_name: string;
   is_admin: boolean;
   has_password: boolean;
+  status: string;
+  telegram_id: number;
   created_at: string;
 }
 
@@ -39,6 +41,27 @@ const badge = (color: string, bg: string): React.CSSProperties => ({
   color,
 });
 
+const statusBadge = (status: string): React.CSSProperties => {
+  switch (status) {
+    case 'pending':
+      return badge('#f59e0b', 'rgba(245,158,11,0.15)');
+    case 'approved':
+      return badge('#22c55e', 'rgba(34,197,94,0.15)');
+    case 'blocked':
+      return badge('#ef4444', 'rgba(239,68,68,0.15)');
+    default:
+      return badge('var(--text-secondary)', 'rgba(128,128,128,0.15)');
+  }
+};
+
+const smallBtn = (color: string): React.CSSProperties => ({
+  background: 'none',
+  border: 'none',
+  cursor: 'pointer',
+  color,
+  fontSize: 14,
+});
+
 function Users() {
   const [users, setUsers] = useState<User[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -55,7 +78,13 @@ function Users() {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return res.json();
       })
-      .then((data) => setUsers(Array.isArray(data) ? data : []))
+      .then((data) => {
+        const list: User[] = Array.isArray(data) ? data : [];
+        // Sort: pending first, then approved, then blocked
+        const order: Record<string, number> = { pending: 0, approved: 1, blocked: 2 };
+        list.sort((a, b) => (order[a.status] ?? 3) - (order[b.status] ?? 3));
+        setUsers(list);
+      })
       .catch((err) => setError(err.message));
   }, []);
 
@@ -109,6 +138,24 @@ function Users() {
     }
   };
 
+  const handleStatusChange = async (userId: string, status: string) => {
+    try {
+      const res = await fetch(`/api/admin/users/${userId}/status`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status }),
+      });
+      if (!res.ok) {
+        const data = await res.json();
+        setError(data.error || 'Failed to update status');
+        return;
+      }
+      fetchUsers();
+    } catch (err: any) {
+      setError(err.message);
+    }
+  };
+
   const handleDelete = async (user: User) => {
     if (!confirm(`Delete user "${user.username}"? This will also delete their agents.`)) return;
     try {
@@ -158,6 +205,7 @@ function Users() {
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
               <span style={{ fontSize: 18, fontWeight: 600, color: 'var(--text-primary)' }}>{user.username}</span>
               <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                <span style={statusBadge(user.status)}>{user.status}</span>
                 {user.is_admin && (
                   <span style={badge('var(--accent)', 'var(--accent-muted)')}>admin</span>
                 )}
@@ -169,17 +217,30 @@ function Users() {
             {user.display_name && (
               <div style={{ fontSize: 15, color: 'var(--text-tertiary)', marginBottom: 4 }}>{user.display_name}</div>
             )}
-            <div style={{ fontSize: 14, color: 'var(--text-muted)', marginBottom: 8 }}>ID: {user.id}</div>
-            <div style={{ display: 'flex', gap: 12 }}>
+            <div style={{ fontSize: 14, color: 'var(--text-muted)', marginBottom: 8 }}>
+              ID: {user.id}
+              {user.telegram_id > 0 && <span> &middot; TG: {user.telegram_id}</span>}
+            </div>
+            <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+              {user.status !== 'approved' && (
+                <button onClick={() => handleStatusChange(user.id, 'approved')} style={smallBtn('#22c55e')}>
+                  Approve
+                </button>
+              )}
+              {user.status !== 'blocked' && (
+                <button onClick={() => handleStatusChange(user.id, 'blocked')} style={smallBtn('#ef4444')}>
+                  Block
+                </button>
+              )}
               <button
                 onClick={() => { setPwUser(user); setShowCreate(false); setNewPw(''); }}
-                style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)', fontSize: 14 }}
+                style={smallBtn('var(--text-secondary)')}
               >
                 Set Password
               </button>
               <button
                 onClick={() => handleDelete(user)}
-                style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#ef4444', fontSize: 14 }}
+                style={smallBtn('#ef4444')}
               >
                 Delete
               </button>

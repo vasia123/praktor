@@ -95,6 +95,21 @@ func Diff(old, new *Config) ConfigDiff {
 	if old.Vault.Passphrase != new.Vault.Passphrase {
 		d.NonReloadable = append(d.NonReloadable, "vault.passphrase")
 	}
+	if !int64SliceEqual(old.Telegram.AllowFrom, new.Telegram.AllowFrom) {
+		d.NonReloadable = append(d.NonReloadable, "telegram.allow_from")
+	}
 
 	return d
+}
+
+func int64SliceEqual(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

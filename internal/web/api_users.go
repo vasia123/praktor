@@ -22,6 +22,7 @@ func (s *Server) registerUserAPI(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/admin/users", s.adminListUsers)
 	mux.HandleFunc("POST /api/admin/users", s.adminCreateUser)
 	mux.HandleFunc("PUT /api/admin/users/{id}/password", s.adminUpdatePassword)
+	mux.HandleFunc("PUT /api/admin/users/{id}/status", s.adminUpdateUserStatus)
 	mux.HandleFunc("DELETE /api/admin/users/{id}", s.adminDeleteUser)
 }
 
@@ -234,6 +235,8 @@ func (s *Server) adminListUsers(w http.ResponseWriter, r *http.Request) {
 			"display_name": u.DisplayName,
 			"is_admin":     u.IsAdmin,
 			"has_password":  u.Password != "",
+			"status":       u.Status,
+			"telegram_id":  u.TelegramID,
 			"created_at":   u.CreatedAt,
 		})
 	}
@@ -317,6 +320,54 @@ func (s *Server) adminUpdatePassword(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.UpdateUserPassword(id, string(hash)); err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	jsonResponse(w, map[string]string{"status": "updated"})
+}
+
+func (s *Server) adminUpdateUserStatus(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+
+	id := r.PathValue("id")
+	var body struct {
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	switch body.Status {
+	case "approved", "blocked", "pending":
+		// valid
+	default:
+		jsonError(w, "status must be one of: approved, blocked, pending", http.StatusBadRequest)
+		return
+	}
+
+	// Prevent self-block
+	sess := getSession(r)
+	if sess != nil && sess.UserID == id && body.Status != "approved" {
+		jsonError(w, "cannot change your own status", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.store.UpdateUserStatus(id, body.Status); err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// If approved and user has a telegram_id, publish NATS event so bot can notify
+	if body.Status == "approved" && s.nats != nil {
+		user, _ := s.store.GetUser(id)
+		if user != nil && user.TelegramID > 0 {
+			_ = s.nats.PublishJSON("events.users.approved", map[string]any{
+				"user_id":     id,
+				"telegram_id": user.TelegramID,
+			})
+		}
 	}
 
 	jsonResponse(w, map[string]string{"status": "updated"})

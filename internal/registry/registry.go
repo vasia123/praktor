@@ -88,8 +88,8 @@ func (r *Registry) Sync() error {
 	return r.ensureGlobalDirectory()
 }
 
-// syncUsers creates users from allow_from if they don't exist.
-// First user becomes admin.
+// syncUsers seeds users from allow_from only when the DB has no users.
+// First user becomes admin. Once users exist in DB, allow_from is ignored.
 func (r *Registry) syncUsers() error {
 	if len(r.allowFrom) == 0 {
 		return nil
@@ -99,28 +99,23 @@ func (r *Registry) syncUsers() error {
 	if err != nil {
 		return err
 	}
+	if userCount > 0 {
+		return nil // DB has users, skip seeding
+	}
 
 	for i, telegramID := range r.allowFrom {
 		id := fmt.Sprintf("%d", telegramID)
-		existing, err := r.store.GetUser(id)
-		if err != nil {
-			return err
-		}
-		if existing != nil {
-			continue
-		}
-
-		isAdmin := userCount == 0 && i == 0
 		u := &store.User{
-			ID:       id,
-			Username: id,
-			IsAdmin:  isAdmin,
+			ID:         id,
+			Username:   id,
+			IsAdmin:    i == 0,
+			Status:     "approved",
+			TelegramID: telegramID,
 		}
 		if err := r.store.CreateUser(u); err != nil {
 			return fmt.Errorf("create user %s: %w", id, err)
 		}
-		slog.Info("created user from allow_from", "id", id, "is_admin", isAdmin)
-		userCount++
+		slog.Info("seeded user from allow_from", "id", id, "is_admin", i == 0)
 	}
 	return nil
 }

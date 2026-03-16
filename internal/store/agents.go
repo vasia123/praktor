@@ -138,10 +138,11 @@ func (s *Store) DeleteAgent(id string) error {
 
 func (s *Store) DeleteAgentsNotIn(ids []string) error {
 	if len(ids) == 0 {
-		_, err := s.db.Exec(`DELETE FROM agents`)
+		// Only delete YAML-managed agents (no user_id), keep user-created ones
+		_, err := s.db.Exec(`DELETE FROM agents WHERE user_id = ''`)
 		return err
 	}
-	query := `DELETE FROM agents WHERE id NOT IN (`
+	query := `DELETE FROM agents WHERE user_id = '' AND id NOT IN (`
 	args := make([]any, len(ids))
 	for i, id := range ids {
 		if i > 0 {

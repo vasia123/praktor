@@ -65,6 +65,29 @@ function sessionKey(chatID: string, agentName: string): string {
   return `${chatID}:${agentName}`;
 }
 
+const SESSION_MAP_PATH = "/workspace/agent/.session-map.json";
+
+function loadSessionMap(): void {
+  try {
+    const data = readFileSync(SESSION_MAP_PATH, "utf-8");
+    const loaded = JSON.parse(data) as Record<string, string>;
+    for (const [key, sessionId] of Object.entries(loaded)) {
+      sessionsByKey.set(key, sessionId);
+    }
+    console.log(`[agent] loaded ${sessionsByKey.size} session(s) from disk`);
+  } catch {
+    // No existing session map or parse error — start fresh
+  }
+}
+
+function saveSessionMap(): void {
+  try {
+    writeFileSync(SESSION_MAP_PATH, JSON.stringify(Object.fromEntries(sessionsByKey)));
+  } catch (err) {
+    console.warn("[agent] failed to save session map:", err);
+  }
+}
+
 function installGlobalInstructions(): void {
   // Write global instructions to ~/.claude/CLAUDE.md (user-level).
   // Claude Code automatically loads both user-level and project-level CLAUDE.md,
@@ -523,6 +546,7 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
         if (event.type === "result" && event.subtype === "success") {
           fullResponse = event.result;
           sessionsByKey.set(sessKey, event.session_id);
+          saveSessionMap();
         } else if (event.type === "assistant") {
           for (const block of event.message.content) {
             if (block.type === "text") {
@@ -694,6 +718,7 @@ async function handleControl(
             sessionsByKey.delete(key);
           }
         }
+        saveSessionMap();
         console.log(`[agent] session cleared for chat ${clearChatID}`);
       } else {
         // Global session clear
@@ -706,6 +731,7 @@ async function handleControl(
         ]) {
           try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
         }
+        saveSessionMap();
         console.log("[agent] all sessions cleared");
       }
       msg.respond(new TextEncoder().encode(JSON.stringify({ status: "ok" })));
@@ -767,6 +793,8 @@ async function main(): Promise<void> {
 
   // Flush to ensure subscriptions are registered with NATS server
   await bridge.flush();
+
+  loadSessionMap();
 
   await bridge.publishReady();
   console.log(`[agent] ready and listening for messages`);

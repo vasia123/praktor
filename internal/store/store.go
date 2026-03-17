@@ -173,6 +173,15 @@ func (s *Store) migrate() error {
 		_, _ = s.db.Exec(stmt)
 	}
 
+	// Fix scheduled tasks that were created with container IDs ("user-{userID}")
+	// instead of real agent UUIDs. Map them to the correct agent ID from the agents table.
+	_, _ = s.db.Exec(`UPDATE scheduled_tasks SET agent_id = (
+		SELECT a.id FROM agents a WHERE a.user_id = REPLACE(scheduled_tasks.agent_id, 'user-', '')
+		LIMIT 1
+	) WHERE agent_id LIKE 'user-%' AND EXISTS (
+		SELECT 1 FROM agents a WHERE a.user_id = REPLACE(scheduled_tasks.agent_id, 'user-', '')
+	)`)
+
 	// Normalized extension tables
 	extTables := []string{
 		`CREATE TABLE IF NOT EXISTS agent_mcp_servers (

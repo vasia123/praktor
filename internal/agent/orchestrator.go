@@ -39,8 +39,9 @@ type Orchestrator struct {
 	cfg        config.DefaultsConfig
 	sessions   *SessionTracker
 	queues     map[string]*AgentQueue
-	lastMeta   map[string]map[string]string // agentID → last message meta
-	mu         sync.RWMutex
+	lastMeta       map[string]map[string]string // agentID → last message meta
+	containerAgent map[string]string            // containerID → real agentID (UUID)
+	mu             sync.RWMutex
 	listeners        []OutputListener
 	fileListeners    []FileListener
 	taskListeners    []TaskCreatedListener
@@ -85,7 +86,8 @@ func NewOrchestrator(bus *natsbus.Bus, ctr *container.Manager, s *store.Store, r
 		cfg:        cfg,
 		sessions:   NewSessionTracker(),
 		queues:     make(map[string]*AgentQueue),
-		lastMeta:   make(map[string]map[string]string),
+		lastMeta:       make(map[string]map[string]string),
+		containerAgent: make(map[string]string),
 	}
 
 	client, err := natsbus.NewClient(bus)
@@ -344,6 +346,9 @@ func (o *Orchestrator) executeMessage(ctx context.Context, containerID string, m
 	// Store meta so output handler can route responses back (keyed by containerID)
 	o.mu.Lock()
 	o.lastMeta[containerID] = msg.Meta
+	if containerID != agentID {
+		o.containerAgent[containerID] = agentID
+	}
 	o.mu.Unlock()
 
 	data, _ := json.Marshal(payload)
@@ -497,19 +502,27 @@ func (o *Orchestrator) handleIPC(msg *nats.Msg) {
 		return
 	}
 
-	// Extract agentID from subject: host.ipc.{agentID}
-	agentID := msg.Subject
-	if idx := len("host.ipc."); idx < len(agentID) {
-		agentID = agentID[idx:]
+	// Extract containerID from subject: host.ipc.{containerID}
+	containerID := msg.Subject
+	if idx := len("host.ipc."); idx < len(containerID) {
+		containerID = containerID[idx:]
 	}
 
-	slog.Info("IPC command received", "type", cmd.Type, "agent", agentID)
+	// Resolve real agent UUID for user containers (containerID="user-123" → real UUID)
+	realAgentID := containerID
+	o.mu.RLock()
+	if mapped, ok := o.containerAgent[containerID]; ok {
+		realAgentID = mapped
+	}
+	o.mu.RUnlock()
+
+	slog.Info("IPC command received", "type", cmd.Type, "container", containerID, "agent", realAgentID)
 
 	switch cmd.Type {
 	case "create_task":
-		o.ipcCreateTask(msg, agentID, cmd.Payload)
+		o.ipcCreateTask(msg, containerID, realAgentID, cmd.Payload)
 	case "list_tasks":
-		o.ipcListTasks(msg, agentID)
+		o.ipcListTasks(msg, realAgentID)
 	case "update_task":
 		o.ipcUpdateTask(msg, cmd.Payload)
 	case "delete_task":
@@ -519,19 +532,19 @@ func (o *Orchestrator) handleIPC(msg *nats.Msg) {
 	case "update_user_md":
 		o.ipcUpdateUserMD(msg, cmd.Payload)
 	case "swarm_message":
-		o.ipcSwarmMessage(msg, agentID, cmd.Payload)
+		o.ipcSwarmMessage(msg, containerID, cmd.Payload)
 	case "get_agent_config":
 		o.ipcGetAgentConfig(msg, cmd.Payload)
 	case "extension_status":
-		o.ipcExtensionStatus(msg, agentID, cmd.Payload)
+		o.ipcExtensionStatus(msg, realAgentID, cmd.Payload)
 	case "send_file":
-		o.ipcSendFile(msg, agentID, cmd.Payload)
+		o.ipcSendFile(msg, containerID, cmd.Payload)
 	case "tg_send_message", "tg_reply", "tg_edit_message", "tg_delete_message",
 		"tg_forward_message", "tg_send_photo_url", "tg_send_sticker",
 		"tg_send_voice", "tg_send_video_note", "tg_send_animation",
 		"tg_send_poll", "tg_set_reaction", "tg_pin_message", "tg_unpin_message",
 		"tg_get_chat_info":
-		o.ipcTelegramAction(msg, agentID, cmd.Type, cmd.Payload)
+		o.ipcTelegramAction(msg, containerID, cmd.Type, cmd.Payload)
 	default:
 		slog.Warn("unknown IPC command", "type", cmd.Type)
 		o.respondIPC(msg, map[string]any{"error": "unknown command: " + cmd.Type})
@@ -549,7 +562,7 @@ func (o *Orchestrator) respondIPC(msg *nats.Msg, data any) {
 	}
 }
 
-func (o *Orchestrator) ipcCreateTask(msg *nats.Msg, agentID string, payload json.RawMessage) {
+func (o *Orchestrator) ipcCreateTask(msg *nats.Msg, containerID, realAgentID string, payload json.RawMessage) {
 	var req struct {
 		Name     string `json:"name"`
 		Schedule string `json:"schedule"`
@@ -572,13 +585,13 @@ func (o *Orchestrator) ipcCreateTask(msg *nats.Msg, agentID string, payload json
 
 	// Extract user ID from container agent ID (format: "user-{userID}")
 	userID := ""
-	if strings.HasPrefix(agentID, "user-") {
-		userID = strings.TrimPrefix(agentID, "user-")
+	if strings.HasPrefix(containerID, "user-") {
+		userID = strings.TrimPrefix(containerID, "user-")
 	}
 
 	t := &store.ScheduledTask{
 		ID:          uuid.New().String(),
-		AgentID:     agentID,
+		AgentID:     realAgentID,
 		Name:        req.Name,
 		Schedule:    normalized,
 		Prompt:      req.Prompt,
@@ -593,7 +606,7 @@ func (o *Orchestrator) ipcCreateTask(msg *nats.Msg, agentID string, payload json
 		return
 	}
 
-	slog.Info("task created via IPC", "id", t.ID, "name", t.Name, "agent", agentID, "user_id", userID)
+	slog.Info("task created via IPC", "id", t.ID, "name", t.Name, "agent", realAgentID, "user_id", userID)
 	o.respondIPC(msg, map[string]any{"ok": true, "id": t.ID})
 
 	// Notify listeners about recurring task creation
@@ -607,8 +620,8 @@ func (o *Orchestrator) ipcCreateTask(msg *nats.Msg, agentID string, payload json
 	}
 }
 
-func (o *Orchestrator) ipcListTasks(msg *nats.Msg, agentID string) {
-	tasks, err := o.store.ListTasksForAgent(agentID)
+func (o *Orchestrator) ipcListTasks(msg *nats.Msg, realAgentID string) {
+	tasks, err := o.store.ListTasksForAgent(realAgentID)
 	if err != nil {
 		o.respondIPC(msg, map[string]any{"error": fmt.Sprintf("list failed: %v", err)})
 		return

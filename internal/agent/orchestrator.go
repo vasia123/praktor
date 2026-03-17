@@ -43,6 +43,7 @@ type Orchestrator struct {
 	containerAgent map[string]string            // containerID → real agentID (UUID)
 	mu             sync.RWMutex
 	listeners        []OutputListener
+	statusListeners  []StatusListener
 	fileListeners    []FileListener
 	taskListeners    []TaskCreatedListener
 	telegramHandler  TelegramActionHandler
@@ -51,6 +52,7 @@ type Orchestrator struct {
 }
 
 type OutputListener func(agentID, content string, meta map[string]string)
+type StatusListener func(agentID, status string, meta map[string]string)
 type FileListener func(agentID string, chatID int64, data []byte, name, mimeType, caption string)
 type TaskCreatedListener func(task store.ScheduledTask)
 
@@ -149,6 +151,12 @@ func (o *Orchestrator) OnFile(listener FileListener) {
 	o.listenerMu.Lock()
 	defer o.listenerMu.Unlock()
 	o.fileListeners = append(o.fileListeners, listener)
+}
+
+func (o *Orchestrator) OnStatus(listener StatusListener) {
+	o.listenerMu.Lock()
+	defer o.listenerMu.Unlock()
+	o.statusListeners = append(o.statusListeners, listener)
 }
 
 func (o *Orchestrator) OnTaskCreated(listener TaskCreatedListener) {
@@ -483,6 +491,13 @@ func (o *Orchestrator) handleAgentOutput(msg *nats.Msg) {
 		o.listenerMu.RLock()
 		for _, l := range o.listeners {
 			l(agentID, content, meta)
+		}
+		o.listenerMu.RUnlock()
+	} else if output.Type == "status" {
+		meta := o.getLastMeta(agentID)
+		o.listenerMu.RLock()
+		for _, l := range o.statusListeners {
+			l(agentID, output.Content, meta)
 		}
 		o.listenerMu.RUnlock()
 	}

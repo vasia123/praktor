@@ -529,6 +529,7 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
               await bridge.publishOutput(block.text, "text");
             } else if (block.type === "tool_use" || block.type === "server_tool_use") {
               console.log(`[agent] [${chatID}] tool: ${block.name}`);
+              await bridge.publishStatus(`🔧 ${block.name}`);
             }
           }
         }

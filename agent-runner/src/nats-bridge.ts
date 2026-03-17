@@ -37,6 +37,10 @@ export class NatsBridge {
     });
   }
 
+  async publishStatus(status: string): Promise<void> {
+    await this.publish(`agent.${this.agentId}.output`, { type: "status", content: status });
+  }
+
   async publishReady(): Promise<void> {
     await this.publish(`agent.${this.agentId}.ready`, { status: "ready" });
   }

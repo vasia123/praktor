@@ -50,6 +50,11 @@ type Bot struct {
 	// Track swarm → chat_id for result delivery
 	swarmChatMu sync.RWMutex
 	swarmChat   map[string]int64 // swarmID → chatID
+
+	// Status message tracking for live feedback
+	statusMsgMu  sync.Mutex
+	statusMsg    map[int64]int       // chatID → Telegram message ID of status msg
+	statusEditAt map[int64]time.Time // chatID → last edit time (for debounce)
 }
 
 func NewBot(cfg config.TelegramConfig, orch *agent.Orchestrator, rtr *router.Router, sc *swarm.Coordinator, reg *registry.Registry, bus *natsbus.Bus, s *store.Store) (*Bot, error) {
@@ -67,9 +72,11 @@ func NewBot(cfg config.TelegramConfig, orch *agent.Orchestrator, rtr *router.Rou
 		swarmCoord: sc,
 		registry:   reg,
 		bus:        bus,
-		chatAgent:  make(map[int64]string),
-		msgAgent:   make(map[int]string),
-		swarmChat:  make(map[string]int64),
+		chatAgent:    make(map[int64]string),
+		msgAgent:     make(map[int]string),
+		swarmChat:    make(map[string]int64),
+		statusMsg:    make(map[int64]int),
+		statusEditAt: make(map[int64]time.Time),
 	}
 
 	// Register bot commands with Telegram so they appear in the menu
@@ -117,6 +124,9 @@ func NewBot(cfg config.TelegramConfig, orch *agent.Orchestrator, rtr *router.Rou
 			return
 		}
 
+		// Delete status message before sending the result
+		b.deleteStatusMessage(context.Background(), chatID)
+
 		// Prefix with agent name for attribution (skip for default agent)
 		attributed := content
 		if agentID != rtr.DefaultAgent() {
@@ -134,6 +144,32 @@ func NewBot(cfg config.TelegramConfig, orch *agent.Orchestrator, rtr *router.Rou
 		} else if err := b.sendAgentMessage(context.Background(), chatID, attributed, agentID); err != nil {
 			slog.Error("failed to send telegram message", "chat", chatID, "error", err)
 		}
+	})
+
+	// Register status listener to update live status messages
+	orch.OnStatus(func(agentID, status string, meta map[string]string) {
+		chatIDStr := ""
+		if meta != nil {
+			chatIDStr = meta["chat_id"]
+		}
+		if chatIDStr == "" {
+			b.chatAgentMu.RLock()
+			for cid, aid := range b.chatAgent {
+				if aid == agentID {
+					chatIDStr = strconv.FormatInt(cid, 10)
+					break
+				}
+			}
+			b.chatAgentMu.RUnlock()
+		}
+		if chatIDStr == "" {
+			return
+		}
+		chatID, err := strconv.ParseInt(chatIDStr, 10, 64)
+		if err != nil {
+			return
+		}
+		b.editStatusMessage(context.Background(), chatID, status)
 	})
 
 	// Register file listener to send files back to Telegram
@@ -495,6 +531,8 @@ func (b *Bot) handleMessage(ctx context.Context, msg telego.Message) {
 	if err := b.orch.HandleMessage(ctx, agentID, cleanedMessage, meta); err != nil {
 		slog.Error("handle message failed", "agent", agentID, "error", err)
 		_ = b.SendMessage(ctx, chatID, "Sorry, I encountered an error processing your message.")
+	} else {
+		go b.sendStatusMessage(context.Background(), chatID, "⏳")
 	}
 }
 
@@ -680,6 +718,71 @@ func (b *Bot) SendDocument(ctx context.Context, chatID int64, data []byte, name,
 
 func (b *Bot) sendChatAction(ctx context.Context, chatID int64, action string) error {
 	return b.bot.SendChatAction(ctx, tu.ChatAction(tu.ID(chatID), action))
+}
+
+// sendStatusMessage sends a new status message and tracks its ID.
+// Skips if there's already a status message for this chat.
+func (b *Bot) sendStatusMessage(ctx context.Context, chatID int64, text string) {
+	b.statusMsgMu.Lock()
+	defer b.statusMsgMu.Unlock()
+
+	if _, exists := b.statusMsg[chatID]; exists {
+		return
+	}
+
+	msg := tu.Message(tu.ID(chatID), text)
+	sent, err := b.bot.SendMessage(ctx, msg)
+	if err != nil {
+		slog.Warn("failed to send status message", "chat", chatID, "error", err)
+		return
+	}
+	b.statusMsg[chatID] = sent.MessageID
+	b.statusEditAt[chatID] = time.Now()
+}
+
+// editStatusMessage edits the tracked status message.
+// Debounces to max 1 edit/second per chat to avoid Telegram rate limits.
+func (b *Bot) editStatusMessage(ctx context.Context, chatID int64, text string) {
+	b.statusMsgMu.Lock()
+	defer b.statusMsgMu.Unlock()
+
+	msgID, exists := b.statusMsg[chatID]
+	if !exists {
+		return
+	}
+
+	if time.Since(b.statusEditAt[chatID]) < time.Second {
+		return
+	}
+
+	_, err := b.bot.EditMessageText(ctx, &telego.EditMessageTextParams{
+		ChatID:    tu.ID(chatID),
+		MessageID: msgID,
+		Text:      text,
+	})
+	if err != nil {
+		slog.Warn("failed to edit status message", "chat", chatID, "error", err)
+		return
+	}
+	b.statusEditAt[chatID] = time.Now()
+}
+
+// deleteStatusMessage deletes the tracked status message and removes it from the map.
+func (b *Bot) deleteStatusMessage(ctx context.Context, chatID int64) {
+	b.statusMsgMu.Lock()
+	msgID, exists := b.statusMsg[chatID]
+	if !exists {
+		b.statusMsgMu.Unlock()
+		return
+	}
+	delete(b.statusMsg, chatID)
+	delete(b.statusEditAt, chatID)
+	b.statusMsgMu.Unlock()
+
+	_ = b.bot.DeleteMessage(ctx, &telego.DeleteMessageParams{
+		ChatID:    tu.ID(chatID),
+		MessageID: msgID,
+	})
 }
 
 // handleSwarmCommand parses the swarm syntax and launches a swarm.
@@ -1001,6 +1104,7 @@ func (b *Bot) cmdStop(ctx context.Context, chatID int64, payload string) {
 		_ = b.SendMessage(ctx, chatID, fmt.Sprintf("Failed to stop *%s*: %s", agentID, err))
 		return
 	}
+	b.deleteStatusMessage(ctx, chatID)
 	_ = b.SendMessage(ctx, chatID, fmt.Sprintf("Stopped *%s*.", agentID))
 }
 

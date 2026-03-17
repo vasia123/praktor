@@ -35,6 +35,7 @@ internal/
   natsbus/                       # Embedded NATS server + client helpers + topic naming
   container/                     # Docker container lifecycle, image building, volume mounts
   agent/                         # Message orchestrator, per-agent queue, session tracking
+  agentmail/                     # AgentMail WebSocket client for real-time email events
   registry/                      # Agent registry - syncs YAML config to DB, resolves agent config
   router/                        # Message router - @prefix parsing, smart routing via default agent
   telegram/                      # Telegram bot (telego), long-polling, message chunking
@@ -44,13 +45,13 @@ internal/
 Dockerfile                       # Gateway image (multi-stage: UI + Go + scratch)
 Dockerfile.agent                 # Agent image (multi-stage: Go + playwright-cli + esbuild + alpine)
 agent-runner/src/                # TypeScript: NATS bridge + Claude Code SDK + MCP servers (bundled with esbuild)
-  index.ts                       # Main entrypoint: agent lifecycle, message handling, MCP server registration
+  index.ts                       # Main entrypoint: agent lifecycle, message handling (sequential user messages + parallel scheduled tasks), MCP server registration
   extensions.ts                  # Apply agent extensions on startup (MCP servers, plugins, skills)
   nats-bridge.ts                 # NATS pub/sub wrapper for agent ↔ host communication
   ipc.ts                         # Shared NATS IPC helper (sendIPC + IPCResponse)
   mcp-tasks.ts                   # MCP server: scheduled_task_create/list/delete
   mcp-profile.ts                 # MCP server: user_profile_read/update
-  mcp-memory.ts                  # MCP server: memory_store/recall/list/delete/forget
+  mcp-memory.ts                  # MCP server: memory_store/recall/list/delete/forget + vector embeddings
   mcp-swarm.ts                   # MCP server: swarm_chat_send (conditional on SWARM_CHAT_TOPIC)
   mcp-nix.ts                     # MCP server: nix_search/add/list_installed/remove/upgrade
   mcp-file.ts                    # MCP server: file_send (send files to Telegram)
@@ -100,6 +101,7 @@ Loaded from YAML (default: `config/praktor.yaml`, override with `PRAKTOR_CONFIG`
 | `PRAKTOR_WEB_PORT` | `web.port` | Web UI port (default: 8080) |
 | `PRAKTOR_AGENT_MODEL` | `defaults.model` | Override default Claude model |
 | `PRAKTOR_VAULT_PASSPHRASE` | `vault.passphrase` | Encryption passphrase for secrets vault |
+| `AGENTMAIL_API_KEY` | `agentmail.api_key` | AgentMail API key for email capabilities (optional) |
 
 Hardcoded paths (not configurable): `data/praktor.db` (SQLite), `data/agents` (agent workspaces).
 
@@ -117,6 +119,7 @@ Agents are defined in the `agents` map in YAML config. Each agent has:
 - `allowed_tools` - Restrict Claude tools
 - `claude_md` - Relative path to agent-specific CLAUDE.md
 - `nix_enabled` - Enable nix package manager in agent container (starts nix-daemon)
+- `agentmail_inbox_id` - AgentMail inbox ID for email capabilities (optional, requires `agentmail.api_key`)
 
 The `router.default_agent` must reference an existing agent.
 
@@ -148,7 +151,7 @@ The gateway watches the config file for changes (mtime polled every 3s, SHA-256 
 
 **Reloadable:** Agent definitions (all fields), defaults (model, image, max_running, idle_timeout), router.default_agent, scheduler poll_interval, telegram main_chat_id.
 
-**Not reloadable** (warning logged): telegram.token, web.port, nats.data_dir, vault.passphrase.
+**Not reloadable** (warning logged): telegram.token, web.port, nats.data_dir, vault.passphrase, agentmail.api_key.
 
 Running agents whose config changed are stopped and lazily restarted on the next message. Added agents become routable immediately. Removed agents are stopped.
 
@@ -170,8 +173,8 @@ Key implementation: `internal/web/server.go` (session store, handlers, middlewar
 ## NATS Topics
 
 ```
-agent.{agentID}.input           # Host → Container: user messages
-agent.{agentID}.output          # Container → Host: agent responses (text, result)
+agent.{agentID}.input           # Host → Container: user messages (includes msg_id for correlation)
+agent.{agentID}.output          # Container → Host: agent responses (text, result) with msg_id
 agent.{agentID}.control         # Host → Container: shutdown, ping
 agent.{agentID}.route           # Host → Container: routing classification queries
 host.ipc.{agentID}              # Container → Host: IPC commands
@@ -285,24 +288,23 @@ Each MCP tool domain lives in its own file under `agent-runner/src/mcp-*.ts`. To
 4. Register it in `agent-runner/src/index.ts` under `mcpServers` with `command: "node", args: ["/app/mcp-{domain}.js"]`
 5. The `allowedTools` wildcard `"mcp__praktor-*"` covers all `praktor-*` named servers automatically
 
-## Browser Automation (playwright-cli)
+## Browser Automation (agent-browser)
 
-All agent containers include [playwright-cli](https://github.com/microsoft/playwright-cli) (`@playwright/cli`) pre-installed and configured to use the system Chromium on Alpine. Agents interact with browsers via Bash commands (more token-efficient than MCP).
+All agent containers include [agent-browser](https://github.com/vercel-labs/agent-browser) built from source and configured to use the system Chromium on Alpine. Agents interact with browsers via Bash commands (more token-efficient than MCP).
 
 **Build-time setup** (`Dockerfile.agent`):
-- Separate `playwright-cli` build stage installs `@playwright/cli` globally and runs `playwright-cli install --skills --config` to extract the skill files without downloading browsers
-- The `@playwright` node_modules and skill directory are copied to the runtime image at `/usr/local/lib/node_modules/@playwright` and `/opt/playwright-cli/skill/`
-- A `cli.config.json` is generated at `/opt/playwright-cli/cli.config.json` pointing to `/usr/bin/chromium-browser` with `--no-sandbox`, `--disable-gpu`, `--disable-dev-shm-usage`
-- `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` and `PLAYWRIGHT_BROWSERS_PATH=/usr/bin` env vars prevent Playwright from downloading its own browsers
+- Separate `rust-build` stage clones the repo and compiles the native Rust CLI via `cargo build --release` on Alpine (musl-compatible binary)
+- The compiled binary is copied to `/usr/local/bin/agent-browser` and the skill directory to `/opt/agent-browser/skill/`
+- A `config.json` is generated at `/opt/agent-browser/config.json` pointing to system Chromium at `/usr/bin/chromium-browser`
 
-**Runtime setup** (`agent-runner/src/index.ts` → `setupPlaywrightCli()`):
-- Symlinks `/opt/playwright-cli/skill` → `/home/praktor/.claude/skills/playwright-cli` (skill loaded into system prompt)
-- Symlinks `/opt/playwright-cli/cli.config.json` → `/workspace/agent/.playwright/cli.config.json` (playwright-cli resolves config relative to cwd)
+**Runtime setup** (`agent-runner/src/index.ts` → `setupAgentBrowser()`):
+- Symlinks `/opt/agent-browser/skill` → `/home/praktor/.claude/skills/agent-browser` (skill loaded into system prompt)
+- Symlinks `/opt/agent-browser/config.json` → `/home/praktor/.agent-browser/config.json` (agent-browser resolves config from `~/.agent-browser/`)
 - Symlinks (not copies) ensure agents always use the image's version — updates come from rebuilding the image
 
-**Browser lifecycle:** The browser session persists across messages within the same agent session. Agents use tabs (`tab-new`, `tab-close`) for multiple pages. Everything shuts down with the container on idle timeout.
+**Browser lifecycle:** The browser session persists across messages within the same agent session. Everything shuts down with the container on idle timeout.
 
-**System prompt:** When `/opt/playwright-cli` exists, a prompt section tells agents that playwright-cli is pre-installed and to never install playwright/chromium via npm, npx, or nix.
+**System prompt:** When `/opt/agent-browser` exists, a prompt section tells agents that agent-browser is pre-installed and to never install browsers via npm, npx, or nix.
 
 ## What it supports
 
@@ -310,16 +312,17 @@ All agent containers include [playwright-cli](https://github.com/microsoft/playw
 - Named agents - Multiple agents with distinct roles, models, and configurations
 - Smart routing - `@agent_name` prefix or AI-powered routing via default agent
 - Isolated agent context - Each agent has its own CLAUDE.md memory, isolated filesystem, and runs in its own container sandbox
-- Persistent memory - SQLite-backed per-agent memory (`/workspace/agent/memory.db`) with MCP tools (memory_store, memory_recall, memory_list, memory_delete, memory_forget). Existing memory keys are listed in the system prompt so agents know what's stored.
-- Scheduled tasks - Cron/interval/relative delay (+30s, +5m, +2h)/one-shot jobs that run Claude and deliver results
+- Persistent memory - SQLite-backed per-agent memory (`/workspace/agent/memory.db`) with MCP tools (memory_store, memory_recall, memory_list, memory_delete, memory_forget). Uses hybrid search combining FTS5 keyword matching with vector semantic similarity (all-MiniLM-L6-v2, 384 dims, quantized int8 via `@huggingface/transformers`) using Reciprocal Rank Fusion. Embeddings are computed async on store and backfilled on first MCP server start for existing memories. Existing memory keys are listed in the system prompt so agents know what's stored.
+- Scheduled tasks - Cron/interval/relative delay (+30s, +5m, +2h)/one-shot jobs that run Claude and deliver results. Tasks execute in parallel (up to `MAX_PARALLEL_TASKS`, default 3) with fresh sessions, while regular user messages remain sequential with conversation continuity
 - Web access - Agents can use WebSearch and WebFetch tools
 - Nix package manager - Agents with `nix_enabled: true` can install packages on demand via MCP tools (nix_search, nix_add, nix_list_installed, nix_remove, nix_upgrade). When nix-daemon is detected, the system prompt instructs agents to auto-install missing tools. The `/nix` Telegram command provides direct user control over agent packages.
 - File sending - Agents can send files (screenshots, PDFs, etc.) to Telegram via the `file_send` MCP tool. Images are sent as photos, other files as documents. Max 12MB per file.
 - File receiving - Files sent to the bot in Telegram (documents, photos, audio, video, voice, video notes, animations) are downloaded and saved to the agent's workspace at `/workspace/agent/uploads/{timestamp}_{filename}`. The agent receives the file path in the message. Supports Telegram's 20MB download limit.
-- Browser automation - [playwright-cli](https://github.com/microsoft/playwright-cli) pre-installed with system Chromium, skill auto-loaded into system prompt. Browser session persists across messages, shuts down with container.
+- Browser automation - [agent-browser](https://github.com/vercel-labs/agent-browser) pre-installed with system Chromium, skill auto-loaded into system prompt. Browser session persists across messages, shuts down with container.
 - Container isolation - Agents sandboxed in Docker containers with NATS communication
 - Agent swarms - Graph-based orchestration: fan-out (parallel), pipeline (sequential with context passing), and collaborative (real-time chat) execution patterns. Visual graph editor in Mission Control, `@swarm` Telegram integration
 - Secure vault - AES-256-GCM encrypted secrets, injected as env vars or files at container start (never exposed to LLM)
+- AgentMail integration - Agents with `agentmail_inbox_id` can send and receive email via the agentmail CLI. Gateway maintains a WebSocket connection to AgentMail for real-time `message.received` events, which are dispatched to the appropriate agent. Each agent is locked to its own inbox ID.
 - Backup & restore - `praktor backup` and `praktor restore` create/restore zstd-compressed tarballs of all `praktor-*` Docker volumes
 - Hot config reload - Config file changes are detected automatically (file polling every 3s) or via SIGHUP; only affected agents are restarted
 - Mission Control UI - Real-time dashboard with WebSocket updates

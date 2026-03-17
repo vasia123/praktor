@@ -38,8 +38,9 @@ type Orchestrator struct {
 	vault      *vault.Vault
 	cfg        config.DefaultsConfig
 	sessions   *SessionTracker
-	queues     map[string]*AgentQueue
+	queues         map[string]*AgentQueue
 	lastMeta       map[string]map[string]string // agentID → last message meta
+	pendingMeta    map[string]map[string]string // msgID → message meta
 	containerAgent map[string]string            // containerID → real agentID (UUID)
 	mu             sync.RWMutex
 	listeners        []OutputListener
@@ -49,6 +50,7 @@ type Orchestrator struct {
 	telegramHandler  TelegramActionHandler
 	listenerMu       sync.RWMutex
 	swarmCoord SwarmCoordinator
+	agentMailAPIKey string
 }
 
 type OutputListener func(agentID, content string, meta map[string]string)
@@ -87,8 +89,9 @@ func NewOrchestrator(bus *natsbus.Bus, ctr *container.Manager, s *store.Store, r
 		vault:      v,
 		cfg:        cfg,
 		sessions:   NewSessionTracker(),
-		queues:     make(map[string]*AgentQueue),
+		queues:         make(map[string]*AgentQueue),
 		lastMeta:       make(map[string]map[string]string),
+		pendingMeta:    make(map[string]map[string]string),
 		containerAgent: make(map[string]string),
 	}
 
@@ -292,6 +295,7 @@ func (o *Orchestrator) executeMessage(ctx context.Context, containerID string, m
 
 		o.resolveSecrets(&opts, agentID, def, hasDef)
 		o.resolveExtensions(&opts, agentID)
+		o.resolveAgentMail(&opts, agentID)
 
 		info, err = o.containers.StartAgent(ctx, opts)
 		if err != nil {
@@ -336,9 +340,11 @@ func (o *Orchestrator) executeMessage(ctx context.Context, containerID string, m
 	}
 
 	// Send message to container via NATS
+	msgID := uuid.New().String()
 	payload := map[string]string{
 		"text":    msg.Text,
 		"agentID": containerID,
+		"msg_id":  msgID,
 	}
 	for k, v := range msg.Meta {
 		payload[k] = v
@@ -354,6 +360,7 @@ func (o *Orchestrator) executeMessage(ctx context.Context, containerID string, m
 	// Store meta so output handler can route responses back (keyed by containerID)
 	o.mu.Lock()
 	o.lastMeta[containerID] = msg.Meta
+	o.pendingMeta[msgID] = msg.Meta
 	if containerID != agentID {
 		o.containerAgent[containerID] = agentID
 	}
@@ -394,6 +401,7 @@ func (o *Orchestrator) RouteQuery(ctx context.Context, agentID string, message s
 
 		o.resolveSecrets(&opts, agentID, def, hasDef)
 		o.resolveExtensions(&opts, agentID)
+		o.resolveAgentMail(&opts, agentID)
 
 		info, err = o.containers.StartAgent(ctx, opts)
 		if err != nil {
@@ -467,6 +475,7 @@ func (o *Orchestrator) handleAgentOutput(msg *nats.Msg) {
 	var output struct {
 		Type    string `json:"type"`
 		Content string `json:"content"`
+		MsgID   string `json:"msg_id"`
 	}
 	if err := json.Unmarshal(msg.Data, &output); err != nil {
 		return
@@ -485,8 +494,11 @@ func (o *Orchestrator) handleAgentOutput(msg *nats.Msg) {
 		_ = o.store.SaveMessage(agentMsg)
 		o.publishMessageEvent(agentMsg)
 
-		// Get metadata from the latest queued message for this agent
-		meta := o.getLastMeta(agentID)
+		// Get metadata: try msg_id first (parallel-safe), fall back to per-agent lastMeta
+		meta := o.popPendingMeta(output.MsgID)
+		if meta == nil {
+			meta = o.getLastMeta(agentID)
+		}
 
 		o.listenerMu.RLock()
 		for _, l := range o.listeners {
@@ -507,6 +519,19 @@ func (o *Orchestrator) getLastMeta(agentID string) map[string]string {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 	return o.lastMeta[agentID]
+}
+
+func (o *Orchestrator) popPendingMeta(msgID string) map[string]string {
+	if msgID == "" {
+		return nil
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	meta, ok := o.pendingMeta[msgID]
+	if ok {
+		delete(o.pendingMeta, msgID)
+	}
+	return meta
 }
 
 func (o *Orchestrator) handleIPC(msg *nats.Msg) {
@@ -554,6 +579,8 @@ func (o *Orchestrator) handleIPC(msg *nats.Msg) {
 		o.ipcExtensionStatus(msg, realAgentID, cmd.Payload)
 	case "send_file":
 		o.ipcSendFile(msg, containerID, cmd.Payload)
+	case "search_history":
+		o.ipcSearchHistory(msg, realAgentID, cmd.Payload)
 	case "tg_send_message", "tg_reply", "tg_edit_message", "tg_delete_message",
 		"tg_forward_message", "tg_send_photo_url", "tg_send_sticker",
 		"tg_send_voice", "tg_send_video_note", "tg_send_animation",
@@ -876,6 +903,40 @@ func (o *Orchestrator) ipcGetAgentConfig(msg *nats.Msg, payload json.RawMessage)
 	o.respondIPC(msg, result)
 }
 
+func (o *Orchestrator) ipcSearchHistory(msg *nats.Msg, agentID string, payload json.RawMessage) {
+	var req struct {
+		Query string `json:"query"`
+		Limit int    `json:"limit"`
+	}
+	if err := json.Unmarshal(payload, &req); err != nil || req.Query == "" {
+		o.respondIPC(msg, map[string]any{"error": "query is required"})
+		return
+	}
+
+	messages, err := o.store.SearchMessages(agentID, req.Query, req.Limit)
+	if err != nil {
+		o.respondIPC(msg, map[string]any{"error": fmt.Sprintf("search failed: %v", err)})
+		return
+	}
+
+	type messageEntry struct {
+		Sender    string `json:"sender"`
+		Content   string `json:"content"`
+		CreatedAt string `json:"created_at"`
+	}
+	out := make([]messageEntry, 0, len(messages))
+	for _, m := range messages {
+		out = append(out, messageEntry{
+			Sender:    m.Sender,
+			Content:   m.Content,
+			CreatedAt: m.CreatedAt.Format(time.RFC3339),
+		})
+	}
+
+	slog.Info("history search via IPC", "agent", agentID, "query", req.Query, "results", len(out))
+	o.respondIPC(msg, map[string]any{"ok": true, "messages": out})
+}
+
 func (o *Orchestrator) publishMessageEvent(msg *store.Message) {
 	if o.client == nil {
 		return
@@ -943,6 +1004,7 @@ func (o *Orchestrator) EnsureAgent(ctx context.Context, agentID string) error {
 	}
 	o.resolveSecrets(&opts, agentID, def, hasDef)
 	o.resolveExtensions(&opts, agentID)
+	o.resolveAgentMail(&opts, agentID)
 
 	info, err := o.containers.StartAgent(ctx, opts)
 	if err != nil {
@@ -1090,21 +1152,38 @@ func (o *Orchestrator) StartNixGC(ctx context.Context) {
 				continue
 			}
 
+			// Stagger agents 10-15 minutes apart
+			stagger := time.Duration(rand.Int64N(int64(5*time.Minute))) + 10*time.Minute
+			slog.Info("nix-gc: next agent scheduled", "agent", ag.ID, "in", stagger.Round(time.Minute))
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(stagger):
+			}
+
 			if err := o.EnsureAgent(ctx, ag.ID); err != nil {
 				slog.Warn("nix-gc: failed to start agent", "agent", ag.ID, "error", err)
 				continue
 			}
 
-			output, err := o.containers.Exec(ctx, ag.ID, []string{"nix-collect-garbage", "-d"})
+			// Upgrade all nix packages first
+			output, err := o.containers.Exec(ctx, ag.ID, []string{"nix", "profile", "upgrade", "--all"})
+			if err != nil {
+				slog.Warn("nix-upgrade failed, skipping agent", "agent", ag.ID, "error", err)
+				continue
+			}
+			if lines := strings.Split(strings.TrimSpace(output), "\n"); len(lines) > 0 && lines[len(lines)-1] != "" {
+				slog.Info("nix-upgrade: [" + ag.ID + "] " + lines[len(lines)-1])
+			}
+
+			// Garbage collect old generations
+			output, err = o.containers.Exec(ctx, ag.ID, []string{"nix-collect-garbage", "-d"})
 			if err != nil {
 				slog.Warn("nix-collect-garbage failed", "agent", ag.ID, "error", err)
 				continue
 			}
-
-			// Log last non-empty line
-			lines := strings.Split(strings.TrimSpace(output), "\n")
-			if len(lines) > 0 {
-				slog.Info("nix-collect-garbage: ["+ag.ID+"] "+lines[len(lines)-1])
+			if lines := strings.Split(strings.TrimSpace(output), "\n"); len(lines) > 0 && lines[len(lines)-1] != "" {
+				slog.Info("nix-collect-garbage: [" + ag.ID + "] " + lines[len(lines)-1])
 			}
 		}
 	}

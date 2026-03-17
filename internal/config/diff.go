@@ -98,6 +98,9 @@ func Diff(old, new *Config) ConfigDiff {
 	if !int64SliceEqual(old.Telegram.AllowFrom, new.Telegram.AllowFrom) {
 		d.NonReloadable = append(d.NonReloadable, "telegram.allow_from")
 	}
+	if old.AgentMail.APIKey != new.AgentMail.APIKey {
+		d.NonReloadable = append(d.NonReloadable, "agentmail.api_key")
+	}
 
 	return d
 }

@@ -1,7 +1,7 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { NatsBridge } from "./nats-bridge.js";
 import { applyExtensions } from "./extensions.js";
-import { readFileSync, readdirSync, mkdirSync, writeFileSync, rmSync, symlinkSync, existsSync } from "fs";
+import { readFileSync, readdirSync, mkdirSync, writeFileSync, rmSync, symlinkSync, existsSync, lstatSync, readlinkSync, unlinkSync } from "fs";
 import { join } from "path";
 import { execSync } from "child_process";
 import { DatabaseSync } from "node:sqlite";
@@ -46,6 +46,12 @@ interface AgentConfig {
   allowed_tools?: string[];
 }
 const agentConfigCache = new Map<string, AgentConfig>();
+
+// Parallel task execution
+const MAX_PARALLEL_TASKS = parseInt(process.env.MAX_PARALLEL_TASKS || "3", 10);
+let activeTaskCount = 0;
+const activeQueries = new Map<string, AsyncIterator<unknown>>();
+const pendingTasks: Array<Record<string, unknown>> = [];
 
 // Swarm collaborative chat buffer
 interface ChatMessage {
@@ -139,27 +145,57 @@ function ensureWorkspace(): void {
   }
 }
 
-function setupPlaywrightCli(): void {
-  const optDir = "/opt/playwright-cli";
-  if (!existsSync(optDir)) return; // playwright-cli not baked into image
+function setupAgentBrowser(): void {
+  const skillSource = "/usr/local/lib/node_modules/agent-browser/skills/agent-browser";
+  const configSource = "/usr/local/share/agent-browser/config.json";
+  if (!existsSync(skillSource)) return; // agent-browser not installed
 
   try {
-    // Symlink skill directory
-    const skillLink = "/home/praktor/.claude/skills/playwright-cli";
-    mkdirSync("/home/praktor/.claude/skills", { recursive: true });
-    if (existsSync(skillLink)) rmSync(skillLink, { recursive: true });
-    symlinkSync(join(optDir, "skill"), skillLink);
+    const skillsDir = "/home/praktor/.claude/skills";
+    mkdirSync(skillsDir, { recursive: true });
 
-    // Symlink cli.config.json (playwright-cli resolves config relative to cwd)
-    const configDir = "/workspace/agent/.playwright";
-    const configLink = join(configDir, "cli.config.json");
+    // Remove stale playwright-cli symlink from previous image versions
+    const staleLink = join(skillsDir, "playwright-cli");
+    try {
+      if (lstatSync(staleLink).isSymbolicLink() && readlinkSync(staleLink) === "/opt/playwright-cli/skill") {
+        unlinkSync(staleLink);
+        console.log("[agent] removed stale playwright-cli skill symlink");
+      }
+    } catch { /* doesn't exist */ }
+
+    // Force-update skill symlink
+    const skillLink = join(skillsDir, "agent-browser");
+    try { unlinkSync(skillLink); } catch { /* doesn't exist */ }
+    symlinkSync(skillSource, skillLink);
+
+    // Force-update config symlink
+    const configDir = "/home/praktor/.agent-browser";
     mkdirSync(configDir, { recursive: true });
-    if (existsSync(configLink)) rmSync(configLink);
-    symlinkSync(join(optDir, "cli.config.json"), configLink);
+    const configLink = join(configDir, "config.json");
+    try { unlinkSync(configLink); } catch { /* doesn't exist */ }
+    symlinkSync(configSource, configLink);
 
-    console.log("[agent] playwright-cli configured");
+    console.log("[agent] agent-browser configured");
   } catch (err) {
-    console.warn("[agent] could not configure playwright-cli:", err);
+    console.warn("[agent] could not configure agent-browser:", err);
+  }
+}
+
+function setupAgentMail(): void {
+  const skillSource = "/opt/agentmail-skill";
+  if (!process.env.AGENTMAIL_API_KEY || !existsSync(join(skillSource, "SKILL.md"))) return;
+
+  try {
+    const skillsDir = "/home/praktor/.claude/skills";
+    mkdirSync(skillsDir, { recursive: true });
+
+    const skillLink = join(skillsDir, "agentmail-cli");
+    try { unlinkSync(skillLink); } catch { /* doesn't exist */ }
+    symlinkSync(skillSource, skillLink);
+
+    console.log("[agent] agentmail-cli skill configured");
+  } catch (err) {
+    console.warn("[agent] could not configure agentmail-cli:", err);
   }
 }
 
@@ -265,11 +301,35 @@ function loadSystemPrompt(includeIdentity = true, meta?: Record<string, string |
     // nix-daemon not running, skip
   }
 
+  // Messaging: explain how agent responses reach the user
+  parts.push(
+    "MESSAGING — Your text responses are automatically delivered to the user via Telegram.\n" +
+    "- To send a message, simply reply with text — no special tool is needed.\n" +
+    "- The file_send tool is ONLY for sending binary files (images, PDFs, etc.), NOT for text messages. NEVER create .txt files to deliver text content.\n" +
+    "- When executing scheduled tasks, your text reply IS the notification the user receives.\n" +
+    "- Keep scheduled task replies short and direct — the user sees them as Telegram messages."
+  );
+
+  // Telegram formatting: instruct agent to use Telegram-compatible Markdown
+  parts.push(
+    "TELEGRAM FORMATTING — Your messages are rendered in Telegram, which only supports MarkdownV1.\n" +
+    "- Bold: *text* (single asterisks, NOT **double**)\n" +
+    "- Italic: _text_\n" +
+    "- Inline code: `code`\n" +
+    "- Code blocks: ```code```\n" +
+    "- Links: [text](url)\n" +
+    "- DO NOT use: # headers, - bullet lists, --- horizontal rules, ![]()" +
+    " image embeds — these render as raw text in Telegram.\n" +
+    "- Instead of headers, use *bold text* on its own line.\n" +
+    "- Instead of bullet lists with - or *, use • (bullet character) or numbered lists."
+  );
+
   // Security: prevent agents from revealing secret values
   parts.push(
     "SECURITY — MANDATORY RULES:\n" +
     "- NEVER reveal, print, or include the values of environment variables that contain secrets, tokens, API keys, passwords, or credentials.\n" +
     "- NEVER read or output the contents of secret files (e.g. service account JSON files, SSH keys, certificates).\n" +
+    "- NEVER include secrets, tokens, API keys, passwords, or credentials in emails. The same redaction rules apply to email as to Telegram.\n" +
     "- If the user asks for a secret value, respond with [REDACTED] in place of the value and explain that secrets cannot be disclosed.\n" +
     "- You may confirm that a secret or env var EXISTS, but must NEVER show its value — always use [REDACTED] as placeholder."
   );
@@ -325,17 +385,31 @@ function loadSystemPrompt(includeIdentity = true, meta?: Record<string, string |
 
     if (existsSync(MEMORY_DB_PATH)) {
       const db = new DatabaseSync(MEMORY_DB_PATH);
-      const rows = db.prepare(
-        "SELECT key, tags FROM memories ORDER BY updated_at DESC"
-      ).all() as Array<{ key: string; tags: string }>;
+      // access_count may not exist yet on older databases
+      let rows: Array<{ key: string; tags: string; access_count?: number }>;
+      try {
+        rows = db.prepare(
+          "SELECT key, tags, access_count FROM memories ORDER BY updated_at DESC"
+        ).all() as typeof rows;
+      } catch {
+        rows = db.prepare(
+          "SELECT key, tags FROM memories ORDER BY updated_at DESC"
+        ).all() as typeof rows;
+      }
       db.close();
 
       if (rows.length > 0) {
         memorySection += `\n\nYou currently have ${rows.length} stored memories:\n`;
         memorySection += rows
-          .map((r) => `- ${r.key}${r.tags ? ` [${r.tags}]` : ""}`)
+          .map((r) => {
+            let line = `- ${r.key}`;
+            if (r.tags) line += ` [${r.tags}]`;
+            if (r.access_count) line += ` (${r.access_count}x)`;
+            return line;
+          })
           .join("\n");
         memorySection += "\n\nCall memory_recall with a relevant keyword to retrieve full content before answering.";
+        memorySection += " memory_recall uses hybrid search combining keyword matching with semantic similarity — use natural language queries for best results.";
       }
     }
     parts.push(memorySection);
@@ -343,15 +417,30 @@ function loadSystemPrompt(includeIdentity = true, meta?: Record<string, string |
     console.warn("[agent] could not load memory keys:", err);
   }
 
-  // playwright-cli: inform agent it's pre-installed with system chromium
-  if (existsSync("/opt/playwright-cli")) {
+  // agent-browser: inform agent it's pre-installed with system chromium
+  if (existsSync("/usr/local/lib/node_modules/agent-browser")) {
     parts.push(
-      "PLAYWRIGHT-CLI — Pre-installed and configured. Do NOT install playwright or chromium via npm, npx, nix, or any other method.\n" +
-      "- `playwright-cli` is already in PATH and ready to use.\n" +
-      "- It is configured to use the system chromium at `/usr/bin/chromium-browser`.\n" +
-      "- Just run `playwright-cli open` to start a browser session.\n" +
-      "- The browser persists across messages. Reuse the existing session — use tabs (`tab-new`, `tab-close`) for multiple pages.\n" +
-      "- Do NOT run `playwright-cli close` or `playwright-cli close-all` — the browser will shut down with the container."
+      "AGENT-BROWSER — Pre-installed and configured. Do NOT install browsers via npm, npx, nix, or any other method.\n" +
+      "- `agent-browser` is already in PATH and ready to use.\n" +
+      "- It is configured to use the system Chromium at `/usr/bin/chromium-browser`.\n" +
+      "- Run `agent-browser open <url>` to start a browser session, then `agent-browser snapshot -i` to see the page.\n" +
+      "- The browser persists across messages. Reuse the existing session.\n" +
+      "- When executing a scheduled task, ALWAYS run `agent-browser close` when done to free resources."
+    );
+  }
+
+  // AgentMail: inbox-locked restrictions when configured
+  if (process.env.AGENTMAIL_API_KEY && process.env.AGENTMAIL_INBOX_ID) {
+    parts.push(
+      "AGENTMAIL — MANDATORY RULES:\n" +
+      `- Your inbox ID is: ${process.env.AGENTMAIL_INBOX_ID}. You MUST use ONLY this inbox ID for ALL agentmail operations.\n` +
+      "- NEVER use, access, list, or reference any other inbox ID, even if the user asks.\n" +
+      "- NEVER create new inboxes.\n" +
+      "- NEVER use pods, webhooks, or domains commands. These are admin-only operations.\n" +
+      "- NEVER include secrets, tokens, API keys, passwords, or credentials in emails.\n" +
+      "- The same secret redaction rules that apply to Telegram apply to email — use [REDACTED] for any secret values.\n" +
+      "- EMAIL FORMATTING: Emails are NOT Telegram messages. Do NOT use Telegram Markdown formatting or escape characters in emails. " +
+      "Write emails in plain text with natural punctuation. No backslash escaping, no *bold*, no `code` — just normal text."
     );
   }
 
@@ -378,6 +467,150 @@ function loadSystemPrompt(includeIdentity = true, meta?: Record<string, string |
   return parts.join("\n\n---\n\n");
 }
 
+function buildQueryOptions(prompt: string, sessionId?: string) {
+  const systemPrompt = loadSystemPrompt();
+  const cwd = "/workspace/agent";
+  const configuredTools = parseAllowedTools(ALLOWED_TOOLS_ENV);
+  const allowedTools = configuredTools || [
+    "Bash",
+    "Read",
+    "Write",
+    "Edit",
+    "Glob",
+    "Grep",
+    "WebSearch",
+    "WebFetch",
+    "Task",
+    "TaskOutput",
+    "mcp__praktor-*",
+  ];
+
+  return {
+    prompt,
+    options: {
+      model: CLAUDE_MODEL,
+      cwd,
+      pathToClaudeCodeExecutable: "/usr/local/bin/claude",
+      systemPrompt: systemPrompt || undefined,
+      ...(sessionId ? { resume: sessionId } : {}),
+      allowedTools,
+      mcpServers: {
+        "praktor-tasks": {
+          type: "stdio",
+          command: "node",
+          args: ["/app/mcp-tasks.mjs"],
+          env: { NATS_URL, AGENT_ID },
+        },
+        "praktor-profile": {
+          type: "stdio",
+          command: "node",
+          args: ["/app/mcp-profile.mjs"],
+          env: { NATS_URL, AGENT_ID },
+        },
+        "praktor-memory": {
+          type: "stdio",
+          command: "node",
+          args: ["/app/mcp-memory.mjs"],
+          env: {},
+        },
+        "praktor-nix": {
+          type: "stdio",
+          command: "node",
+          args: ["/app/mcp-nix.mjs"],
+          env: {},
+        },
+        "praktor-file": {
+          type: "stdio",
+          command: "node",
+          args: ["/app/mcp-file.mjs"],
+          env: { NATS_URL, AGENT_ID },
+        },
+        "praktor-history": {
+          type: "stdio",
+          command: "node",
+          args: ["/app/mcp-history.mjs"],
+          env: { NATS_URL, AGENT_ID },
+        },
+        ...(SWARM_CHAT_TOPIC ? {
+          "praktor-swarm": {
+            type: "stdio",
+            command: "node",
+            args: ["/app/mcp-swarm.mjs"],
+            env: { NATS_URL, AGENT_ID, SWARM_CHAT_TOPIC },
+          },
+        } : {}),
+        ...extensionMcpServers,
+      },
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
+      stderr: (data: string) => {
+        console.error(`[claude-stderr] ${data.trimEnd()}`);
+      },
+    },
+  };
+}
+
+// Execute a scheduled task in parallel (fresh session, no resume)
+async function executeTask(data: Record<string, unknown>): Promise<void> {
+  const text = data.text as string;
+  const msgId = data.msg_id as string | undefined;
+  console.log(`[task] executing parallel task: ${text.substring(0, 100)}...`);
+
+  try {
+    const opts = buildQueryOptions(text);
+    const result = query(opts);
+
+    let fullResponse = "";
+    const iter = result[Symbol.asyncIterator]();
+    if (msgId) activeQueries.set(msgId, iter);
+
+    try {
+      for await (const event of { [Symbol.asyncIterator]: () => iter }) {
+        if (event.type === "result" && event.subtype === "success") {
+          fullResponse = event.result;
+        } else if (event.type === "assistant") {
+          for (const block of event.message.content) {
+            if (block.type === "text") {
+              await bridge.publishOutput(block.text, "text", msgId);
+            } else if (block.type === "tool_use" || block.type === "server_tool_use") {
+              console.log(`[task] tool: ${block.name}`);
+            }
+          }
+        }
+      }
+    } catch (streamErr) {
+      if (fullResponse) {
+        console.warn(`[task] claude process exited with error after successful result, ignoring:`, streamErr);
+      } else {
+        throw streamErr;
+      }
+    }
+
+    if (fullResponse && !aborted) {
+      await bridge.publishResult(fullResponse, msgId);
+    }
+    console.log(`[task] completed`);
+  } catch (err) {
+    if (aborted) {
+      console.log("[task] aborted");
+      return;
+    }
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    console.error(`[task] error:`, err);
+    await bridge.publishResult(`Error: ${errorMsg}`, msgId);
+  } finally {
+    if (msgId) activeQueries.delete(msgId);
+    activeTaskCount--;
+    // Dequeue next pending task
+    if (pendingTasks.length > 0) {
+      const next = pendingTasks.shift()!;
+      activeTaskCount++;
+      console.log(`[task] dequeuing next task (${pendingTasks.length} remaining)`);
+      executeTask(next);
+    }
+  }
+}
+
 async function handleMessage(data: Record<string, unknown>): Promise<void> {
   const text = data.text as string;
   if (!text) return;
@@ -385,6 +618,20 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
   const chatID = (data.chat_id as string) || "_default";
   const agentName = (data.agent_name as string) || "";
   const userId = (data.user_id as string) || USER_ID;
+  const sender = data.sender as string | undefined;
+  const msgId = data.msg_id as string | undefined;
+
+  // Scheduled tasks run in parallel with fresh sessions
+  if (sender === "scheduler") {
+    if (activeTaskCount >= MAX_PARALLEL_TASKS) {
+      pendingTasks.push(data);
+      console.log(`[task] at capacity (${activeTaskCount}/${MAX_PARALLEL_TASKS}), queued (${pendingTasks.length} pending)`);
+      return;
+    }
+    activeTaskCount++;
+    executeTask(data);
+    return;
+  }
 
   // Per-chat serialization: queue if this chat is already being processed
   if (processingChats.has(chatID)) {
@@ -506,6 +753,12 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
             args: ["/app/mcp-file.mjs"],
             env: { NATS_URL, AGENT_ID },
           },
+          "praktor-history": {
+            type: "stdio",
+            command: "node",
+            args: ["/app/mcp-history.mjs"],
+            env: { NATS_URL, AGENT_ID },
+          },
           "praktor-telegram": {
             type: "stdio",
             command: "node",
@@ -550,7 +803,7 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
         } else if (event.type === "assistant") {
           for (const block of event.message.content) {
             if (block.type === "text") {
-              await bridge.publishOutput(block.text, "text");
+              await bridge.publishOutput(block.text, "text", msgId);
             } else if (block.type === "tool_use" || block.type === "server_tool_use") {
               console.log(`[agent] [${chatID}] tool: ${block.name}`);
               await bridge.publishStatus(`🔧 ${block.name}`);
@@ -559,9 +812,6 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
         }
       }
     } catch (streamErr) {
-      // Claude Code native binary may exit with code 1 after streaming
-      // a successful result. If we already have the result, treat it as
-      // a non-fatal warning rather than a failure.
       if (fullResponse) {
         console.warn(`[agent] claude process exited with error after successful result, ignoring:`, streamErr);
       } else {
@@ -571,7 +821,7 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
 
     // Send final result (skip if aborted — orchestrator already notified the user)
     if (fullResponse && !abortedChats.has(chatID)) {
-      await bridge.publishResult(fullResponse);
+      await bridge.publishResult(fullResponse, msgId);
     }
 
     console.log(`[agent] completed processing for agent ${agentName || AGENT_ID} chat ${chatID} (session=${sessionsByKey.get(sessKey)})`);
@@ -582,7 +832,7 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
     }
     const errorMsg = err instanceof Error ? err.message : String(err);
     console.error(`[agent] error processing message:`, err);
-    await bridge.publishResult(`Error: ${errorMsg}`);
+    await bridge.publishResult(`Error: ${errorMsg}`, msgId);
   } finally {
     currentQueryIters.delete(chatID);
     processingChats.delete(chatID);
@@ -696,13 +946,21 @@ async function handleControl(
         processingChats.delete(abortChatID);
         console.log(`[agent] run aborted for chat ${abortChatID}`);
       } else {
-        // Global abort — all chats
+        // Global abort — all chats + parallel tasks
         console.log("[agent] aborting all runs...");
         for (const cid of processingChats) abortedChats.add(cid);
         for (const [, iter] of currentQueryIters) iter.return?.(undefined);
         currentQueryIters.clear();
+        // Abort all parallel task queries
+        for (const [, iter] of activeQueries) iter.return?.(undefined);
+        activeQueries.clear();
+        activeTaskCount = 0;
         pendingByChat.clear();
         processingChats.clear();
+        if (pendingTasks.length > 0) {
+          console.log(`[agent] discarding ${pendingTasks.length} queued task(s)`);
+          pendingTasks.length = 0;
+        }
         try { execSync("pkill -f /usr/local/bin/claude", { timeout: 3000 }); } catch { /* ignore */ }
         console.log("[agent] all runs aborted");
       }
@@ -751,7 +1009,8 @@ async function main(): Promise<void> {
   installGlobalInstructions();
   ensureAgentMd();
   ensureWorkspace();
-  setupPlaywrightCli();
+  setupAgentBrowser();
+  setupAgentMail();
 
   // Apply agent extensions (MCP servers, plugins, skills, settings)
   const extResult = await applyExtensions();

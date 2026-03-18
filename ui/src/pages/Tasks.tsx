@@ -200,6 +200,18 @@ function Tasks() {
     }
   };
 
+  const handleRunNow = async (id: string) => {
+    try {
+      const res = await fetch(`/api/tasks/${id}/run`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        throw new Error(body?.error || `HTTP ${res.status}`);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unknown error');
+    }
+  };
+
   const handleDeleteCompleted = async () => {
     if (!confirm('Delete all completed tasks?')) return;
     try {
@@ -344,6 +356,15 @@ function Tasks() {
               </div>
 
               <div style={{ display: 'flex', gap: 6, flexShrink: 0, marginLeft: 16 }}>
+                {task.status !== 'completed' && (
+                  <button
+                    style={{ ...btnDanger, color: 'var(--accent)' }}
+                    onClick={() => handleRunNow(task.id)}
+                    title="Run now"
+                  >
+                    ▶ Run
+                  </button>
+                )}
                 <button
                   style={{ ...btnDanger, color: 'var(--text-secondary)' }}
                   onClick={() => handleEdit(task)}

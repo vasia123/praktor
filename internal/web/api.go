@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -46,6 +47,7 @@ func (s *Server) registerAPI(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/tasks", s.listTasks)
 	mux.HandleFunc("POST /api/tasks", s.createTask)
 	mux.HandleFunc("PUT /api/tasks/{id}", s.updateTask)
+	mux.HandleFunc("POST /api/tasks/{id}/run", s.runTask)
 	mux.HandleFunc("DELETE /api/tasks/completed", s.deleteCompletedTasks)
 	mux.HandleFunc("DELETE /api/tasks/{id}", s.deleteTask)
 
@@ -400,6 +402,24 @@ func (s *Server) deleteCompletedTasks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonResponse(w, map[string]any{"status": "deleted", "count": count})
+}
+
+func (s *Server) runTask(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	task, err := s.store.GetTask(id)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if task == nil {
+		jsonError(w, "task not found", http.StatusNotFound)
+		return
+	}
+
+	// Execute asynchronously — task execution can take minutes.
+	go s.scheduler.RunTask(context.Background(), id)
+
+	jsonResponse(w, map[string]string{"status": "started"})
 }
 
 func (s *Server) listSwarms(w http.ResponseWriter, r *http.Request) {

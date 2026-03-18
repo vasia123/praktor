@@ -155,7 +155,7 @@ func runGateway() error {
 
 	// Web UI
 	if cfg.Web.Enabled {
-		srv := web.NewServer(db, bus, orch, reg, rtr, swarmCoord, cfg.Web, v, version)
+		srv := web.NewServer(db, bus, orch, reg, rtr, swarmCoord, sched, cfg.Web, v, version)
 		go func() {
 			if err := srv.Start(ctx); err != nil {
 				slog.Error("web server error", "error", err)

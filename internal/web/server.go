@@ -21,6 +21,7 @@ import (
 	"github.com/mtzanidakis/praktor/internal/natsbus"
 	"github.com/mtzanidakis/praktor/internal/registry"
 	"github.com/mtzanidakis/praktor/internal/router"
+	"github.com/mtzanidakis/praktor/internal/scheduler"
 	"github.com/mtzanidakis/praktor/internal/store"
 	"github.com/mtzanidakis/praktor/internal/swarm"
 	"github.com/mtzanidakis/praktor/internal/vault"
@@ -54,6 +55,7 @@ type Server struct {
 	registry   *registry.Registry
 	router     *router.Router
 	swarmCoord *swarm.Coordinator
+	scheduler  *scheduler.Scheduler
 	vault      *vault.Vault
 	hub        *Hub
 	cfg        config.WebConfig
@@ -64,7 +66,7 @@ type Server struct {
 	sessions  map[string]*SessionData // token → session
 }
 
-func NewServer(s *store.Store, bus *natsbus.Bus, orch *agent.Orchestrator, reg *registry.Registry, rtr *router.Router, swarmCoord *swarm.Coordinator, cfg config.WebConfig, v *vault.Vault, version string) *Server {
+func NewServer(s *store.Store, bus *natsbus.Bus, orch *agent.Orchestrator, reg *registry.Registry, rtr *router.Router, swarmCoord *swarm.Coordinator, sched *scheduler.Scheduler, cfg config.WebConfig, v *vault.Vault, version string) *Server {
 	return &Server{
 		store:      s,
 		bus:        bus,
@@ -72,6 +74,7 @@ func NewServer(s *store.Store, bus *natsbus.Bus, orch *agent.Orchestrator, reg *
 		registry:   reg,
 		router:     rtr,
 		swarmCoord: swarmCoord,
+		scheduler:  sched,
 		vault:      v,
 		hub:        NewHub(),
 		cfg:        cfg,

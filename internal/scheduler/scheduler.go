@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"time"
@@ -79,6 +80,19 @@ func (s *Scheduler) Start(ctx context.Context) {
 			s.poll(ctx)
 		}
 	}
+}
+
+// RunTask executes a scheduled task immediately by ID (for manual "Run now").
+func (s *Scheduler) RunTask(ctx context.Context, taskID string) error {
+	task, err := s.store.GetTask(taskID)
+	if err != nil {
+		return fmt.Errorf("get task: %w", err)
+	}
+	if task == nil {
+		return fmt.Errorf("task not found: %s", taskID)
+	}
+	s.execute(ctx, *task)
+	return nil
 }
 
 func (s *Scheduler) poll(ctx context.Context) {

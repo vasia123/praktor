@@ -586,12 +586,15 @@ async function executeTask(data: Record<string, unknown>): Promise<void> {
       }
     }
 
-    if (fullResponse && !aborted) {
+    // Scheduled tasks don't support per-chat abort; check if query was removed from activeQueries.
+    const wasAborted = msgId ? !activeQueries.has(msgId) : false;
+    if (fullResponse && !wasAborted) {
       await bridge.publishResult(fullResponse, msgId);
     }
     console.log(`[task] completed`);
   } catch (err) {
-    if (aborted) {
+    const wasAborted = msgId ? !activeQueries.has(msgId) : false;
+    if (wasAborted) {
       console.log("[task] aborted");
       return;
     }

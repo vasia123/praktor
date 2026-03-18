@@ -808,45 +808,69 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
         },
       });
 
-      // Process streaming result with watchdog
+      // Process streaming result with watchdog using Promise.race
       const iter = result[Symbol.asyncIterator]();
       currentQueryIters.set(chatID, iter);
       let hung = false;
 
       try {
-        let watchdog: ReturnType<typeof setTimeout> | null = null;
-        const resetWatchdog = () => {
-          if (watchdog) clearTimeout(watchdog);
-          watchdog = setTimeout(() => {
+        let done = false;
+        while (!done) {
+          const timeoutPromise = new Promise<{ timeout: true }>((resolve) =>
+            setTimeout(() => resolve({ timeout: true }), WATCHDOG_TIMEOUT_MS)
+          );
+          const nextPromise = iter.next().then((r) => ({ timeout: false as const, ...r }));
+
+          const raceResult = await Promise.race([nextPromise, timeoutPromise]);
+
+          if ("timeout" in raceResult && raceResult.timeout) {
+            // Check if claude subprocesses are still actively working (subagents, etc.)
+            let claudeProcs = 0;
+            try {
+              const { execSync } = await import("child_process");
+              const out = execSync("pgrep -c -f /usr/local/bin/claude", { timeout: 3000 }).toString().trim();
+              claudeProcs = parseInt(out, 10) || 0;
+            } catch { /* pgrep returns exit 1 when no matches */ }
+
+            if (claudeProcs > 1) {
+              // Subagents are running — not a hang, just waiting for them
+              console.log(`[agent] [${chatID}] WATCHDOG: no events for ${WATCHDOG_TIMEOUT_MS / 1000}s but ${claudeProcs} claude processes active (subagents), extending timeout`);
+              continue; // Re-enter the race loop
+            }
+
             console.error(`[agent] [${chatID}] WATCHDOG: no events for ${WATCHDOG_TIMEOUT_MS / 1000}s, killing hung query`);
             hung = true;
+            // Kill the claude CLI process to unblock the iterator
+            try { const { execSync } = await import("child_process"); execSync("pkill -f /usr/local/bin/claude", { timeout: 3000 }); } catch { /* ignore */ }
             iter.return?.(undefined);
-          }, WATCHDOG_TIMEOUT_MS);
-        };
+            break;
+          }
 
-        resetWatchdog();
-        try {
-          for await (const event of { [Symbol.asyncIterator]: () => iter }) {
-            resetWatchdog();
-            console.log(`[agent] [${chatID}] event: type=${event.type}${"subtype" in event ? ` subtype=${event.subtype}` : ""}`);
-            if (event.type === "result" && event.subtype === "success") {
-              fullResponse = event.result;
-              sessionsByKey.set(sessKey, event.session_id);
-              currentResumeId = event.session_id;
-              saveSessionMap();
-            } else if (event.type === "assistant") {
-              for (const block of event.message.content) {
-                if (block.type === "text") {
-                  await bridge.publishOutput(block.text, "text", msgId);
-                } else if (block.type === "tool_use" || block.type === "server_tool_use") {
-                  console.log(`[agent] [${chatID}] tool: ${block.name}`);
-                  await bridge.publishStatus(`🔧 ${block.name}`);
-                }
+          const iterResult = raceResult as { value: unknown; done?: boolean };
+          if (iterResult.done) {
+            done = true;
+            break;
+          }
+
+          const event = iterResult.value as Record<string, unknown>;
+          console.log(`[agent] [${chatID}] event: type=${event.type}${"subtype" in event ? ` subtype=${(event as Record<string, unknown>).subtype}` : ""}`);
+          if (event.type === "result" && (event as Record<string, unknown>).subtype === "success") {
+            fullResponse = (event as Record<string, unknown>).result as string;
+            sessionsByKey.set(sessKey, (event as Record<string, unknown>).session_id as string);
+            currentResumeId = (event as Record<string, unknown>).session_id as string;
+            saveSessionMap();
+          } else if (event.type === "assistant") {
+            const message = (event as Record<string, unknown>).message as Record<string, unknown>;
+            const content = message.content as Array<Record<string, unknown>>;
+            for (const block of content) {
+              if (block.type === "text") {
+                await bridge.publishOutput(block.text as string, "text", msgId);
+              } else if (block.type === "tool_use" || block.type === "server_tool_use") {
+                console.log(`[agent] [${chatID}] tool: ${block.name}`);
+                await bridge.publishStatus(`🔧 ${block.name}`);
               }
             }
           }
-        } finally {
-          if (watchdog) clearTimeout(watchdog);
         }
       } catch (streamErr) {
         if (fullResponse) {

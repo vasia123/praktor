@@ -330,7 +330,7 @@ server.tool(
         `DELETE FROM memories WHERE key LIKE ? OR content LIKE ? OR tags LIKE ?`
       );
       const result = stmt.run(pattern, pattern, pattern);
-      deletedCount = result.changes;
+      deletedCount = Number(result.changes);
     }
 
     return {

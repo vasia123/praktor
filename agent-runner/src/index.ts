@@ -497,44 +497,44 @@ function buildQueryOptions(prompt: string, sessionId?: string) {
       allowedTools,
       mcpServers: {
         "praktor-tasks": {
-          type: "stdio",
+          type: "stdio" as const,
           command: "node",
           args: ["/app/mcp-tasks.mjs"],
           env: { NATS_URL, AGENT_ID },
         },
         "praktor-profile": {
-          type: "stdio",
+          type: "stdio" as const,
           command: "node",
           args: ["/app/mcp-profile.mjs"],
           env: { NATS_URL, AGENT_ID },
         },
         "praktor-memory": {
-          type: "stdio",
+          type: "stdio" as const,
           command: "node",
           args: ["/app/mcp-memory.mjs"],
           env: {},
         },
         "praktor-nix": {
-          type: "stdio",
+          type: "stdio" as const,
           command: "node",
           args: ["/app/mcp-nix.mjs"],
           env: {},
         },
         "praktor-file": {
-          type: "stdio",
+          type: "stdio" as const,
           command: "node",
           args: ["/app/mcp-file.mjs"],
           env: { NATS_URL, AGENT_ID },
         },
         "praktor-history": {
-          type: "stdio",
+          type: "stdio" as const,
           command: "node",
           args: ["/app/mcp-history.mjs"],
           env: { NATS_URL, AGENT_ID },
         },
         ...(SWARM_CHAT_TOPIC ? {
           "praktor-swarm": {
-            type: "stdio",
+            type: "stdio" as const,
             command: "node",
             args: ["/app/mcp-swarm.mjs"],
             env: { NATS_URL, AGENT_ID, SWARM_CHAT_TOPIC },
@@ -542,7 +542,7 @@ function buildQueryOptions(prompt: string, sessionId?: string) {
         } : {}),
         ...extensionMcpServers,
       },
-      permissionMode: "bypassPermissions",
+      permissionMode: "bypassPermissions" as const,
       allowDangerouslySkipPermissions: true,
       stderr: (data: string) => {
         console.error(`[claude-stderr] ${data.trimEnd()}`);
@@ -717,109 +717,150 @@ async function handleMessage(data: Record<string, unknown>): Promise<void> {
     const sessKey = sessionKey(chatID, agentName || AGENT_ID);
     const chatSessionId = sessionsByKey.get(sessKey);
 
-    const result = query({
-      prompt: augmentedText,
-      options: {
-        model,
-        cwd,
-        pathToClaudeCodeExecutable: "/usr/local/bin/claude",
-        systemPrompt: systemPrompt || undefined,
-        ...(chatSessionId ? { resume: chatSessionId } : {}),
-        allowedTools,
-        mcpServers: {
-          "praktor-tasks": {
-            type: "stdio",
-            command: "node",
-            args: ["/app/mcp-tasks.mjs"],
-            env: { NATS_URL, AGENT_ID },
-          },
-          "praktor-profile": {
-            type: "stdio",
-            command: "node",
-            args: ["/app/mcp-profile.mjs"],
-            env: { NATS_URL, AGENT_ID },
-          },
-          "praktor-memory": {
-            type: "stdio",
-            command: "node",
-            args: ["/app/mcp-memory.mjs"],
-            env: {},
-          },
-          "praktor-nix": {
-            type: "stdio",
-            command: "node",
-            args: ["/app/mcp-nix.mjs"],
-            env: {},
-          },
-          "praktor-file": {
-            type: "stdio",
-            command: "node",
-            args: ["/app/mcp-file.mjs"],
-            env: { NATS_URL, AGENT_ID },
-          },
-          "praktor-history": {
-            type: "stdio",
-            command: "node",
-            args: ["/app/mcp-history.mjs"],
-            env: { NATS_URL, AGENT_ID },
-          },
-          "praktor-telegram": {
-            type: "stdio",
-            command: "node",
-            args: ["/app/mcp-telegram.mjs"],
-            env: { NATS_URL, AGENT_ID },
-          },
-          "praktor-projects": {
-            type: "stdio",
-            command: "node",
-            args: ["/app/mcp-projects.mjs"],
-            env: { NATS_URL, AGENT_ID },
-          },
-          ...(SWARM_CHAT_TOPIC ? {
-            "praktor-swarm": {
+    const WATCHDOG_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes without events = hang
+    const MAX_HANG_RETRIES = 2;
+
+    let fullResponse = "";
+    let currentPrompt = augmentedText;
+    let currentResumeId = chatSessionId;
+
+    for (let attempt = 0; attempt <= MAX_HANG_RETRIES; attempt++) {
+      if (attempt > 0) {
+        console.warn(`[agent] [${chatID}] hang recovery attempt ${attempt}/${MAX_HANG_RETRIES}`);
+        await bridge.publishStatus("⚠️ recovering from hang...");
+        // Resume the same session with a recovery prompt
+        currentPrompt = "The previous API request timed out. Continue from where you left off.";
+      }
+
+      const result = query({
+        prompt: currentPrompt,
+        options: {
+          model,
+          cwd,
+          pathToClaudeCodeExecutable: "/usr/local/bin/claude",
+          systemPrompt: systemPrompt || undefined,
+          ...(currentResumeId ? { resume: currentResumeId } : {}),
+          allowedTools,
+          mcpServers: {
+            "praktor-tasks": {
               type: "stdio",
               command: "node",
-              args: ["/app/mcp-swarm.mjs"],
-              env: { NATS_URL, AGENT_ID, SWARM_CHAT_TOPIC },
+              args: ["/app/mcp-tasks.mjs"],
+              env: { NATS_URL, AGENT_ID },
             },
-          } : {}),
-          ...extensionMcpServers,
+            "praktor-profile": {
+              type: "stdio",
+              command: "node",
+              args: ["/app/mcp-profile.mjs"],
+              env: { NATS_URL, AGENT_ID },
+            },
+            "praktor-memory": {
+              type: "stdio",
+              command: "node",
+              args: ["/app/mcp-memory.mjs"],
+              env: {},
+            },
+            "praktor-nix": {
+              type: "stdio",
+              command: "node",
+              args: ["/app/mcp-nix.mjs"],
+              env: {},
+            },
+            "praktor-file": {
+              type: "stdio",
+              command: "node",
+              args: ["/app/mcp-file.mjs"],
+              env: { NATS_URL, AGENT_ID },
+            },
+            "praktor-history": {
+              type: "stdio",
+              command: "node",
+              args: ["/app/mcp-history.mjs"],
+              env: { NATS_URL, AGENT_ID },
+            },
+            "praktor-telegram": {
+              type: "stdio",
+              command: "node",
+              args: ["/app/mcp-telegram.mjs"],
+              env: { NATS_URL, AGENT_ID },
+            },
+            "praktor-projects": {
+              type: "stdio",
+              command: "node",
+              args: ["/app/mcp-projects.mjs"],
+              env: { NATS_URL, AGENT_ID },
+            },
+            ...(SWARM_CHAT_TOPIC ? {
+              "praktor-swarm": {
+                type: "stdio",
+                command: "node",
+                args: ["/app/mcp-swarm.mjs"],
+                env: { NATS_URL, AGENT_ID, SWARM_CHAT_TOPIC },
+              },
+            } : {}),
+            ...extensionMcpServers,
+          },
+          permissionMode: "bypassPermissions",
+          allowDangerouslySkipPermissions: true,
+          stderr: (stderrData: string) => {
+            console.error(`[claude-stderr] ${stderrData.trimEnd()}`);
+          },
         },
-        permissionMode: "bypassPermissions",
-        allowDangerouslySkipPermissions: true,
-        stderr: (stderrData: string) => {
-          console.error(`[claude-stderr] ${stderrData.trimEnd()}`);
-        },
-      },
-    });
+      });
 
-    // Process streaming result
-    let fullResponse = "";
-    const iter = result[Symbol.asyncIterator]();
-    currentQueryIters.set(chatID, iter);
-    try {
-      for await (const event of { [Symbol.asyncIterator]: () => iter }) {
-        console.log(`[agent] [${chatID}] event: type=${event.type}${"subtype" in event ? ` subtype=${event.subtype}` : ""}`);
-        if (event.type === "result" && event.subtype === "success") {
-          fullResponse = event.result;
-          sessionsByKey.set(sessKey, event.session_id);
-          saveSessionMap();
-        } else if (event.type === "assistant") {
-          for (const block of event.message.content) {
-            if (block.type === "text") {
-              await bridge.publishOutput(block.text, "text", msgId);
-            } else if (block.type === "tool_use" || block.type === "server_tool_use") {
-              console.log(`[agent] [${chatID}] tool: ${block.name}`);
-              await bridge.publishStatus(`🔧 ${block.name}`);
+      // Process streaming result with watchdog
+      const iter = result[Symbol.asyncIterator]();
+      currentQueryIters.set(chatID, iter);
+      let hung = false;
+
+      try {
+        let watchdog: ReturnType<typeof setTimeout> | null = null;
+        const resetWatchdog = () => {
+          if (watchdog) clearTimeout(watchdog);
+          watchdog = setTimeout(() => {
+            console.error(`[agent] [${chatID}] WATCHDOG: no events for ${WATCHDOG_TIMEOUT_MS / 1000}s, killing hung query`);
+            hung = true;
+            iter.return?.(undefined);
+          }, WATCHDOG_TIMEOUT_MS);
+        };
+
+        resetWatchdog();
+        try {
+          for await (const event of { [Symbol.asyncIterator]: () => iter }) {
+            resetWatchdog();
+            console.log(`[agent] [${chatID}] event: type=${event.type}${"subtype" in event ? ` subtype=${event.subtype}` : ""}`);
+            if (event.type === "result" && event.subtype === "success") {
+              fullResponse = event.result;
+              sessionsByKey.set(sessKey, event.session_id);
+              currentResumeId = event.session_id;
+              saveSessionMap();
+            } else if (event.type === "assistant") {
+              for (const block of event.message.content) {
+                if (block.type === "text") {
+                  await bridge.publishOutput(block.text, "text", msgId);
+                } else if (block.type === "tool_use" || block.type === "server_tool_use") {
+                  console.log(`[agent] [${chatID}] tool: ${block.name}`);
+                  await bridge.publishStatus(`🔧 ${block.name}`);
+                }
+              }
             }
           }
+        } finally {
+          if (watchdog) clearTimeout(watchdog);
+        }
+      } catch (streamErr) {
+        if (fullResponse) {
+          console.warn(`[agent] claude process exited with error after successful result, ignoring:`, streamErr);
+        } else if (!hung) {
+          throw streamErr;
         }
       }
-    } catch (streamErr) {
-      if (fullResponse) {
-        console.warn(`[agent] claude process exited with error after successful result, ignoring:`, streamErr);
-      } else {
-        throw streamErr;
+
+      if (!hung) break; // Completed normally
+
+      if (attempt === MAX_HANG_RETRIES) {
+        console.error(`[agent] [${chatID}] all hang recovery attempts exhausted`);
+        await bridge.publishResult("Error: query timed out after multiple retries. Please try again.", msgId);
       }
     }
 

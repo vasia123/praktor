@@ -33,6 +33,7 @@ const sessionsByKey = new Map<string, string>(); // "chatID:agentName" → sessi
 const processingChats = new Set<string>(); // chat_ids currently being processed
 const pendingByChat = new Map<string, Array<Record<string, unknown>>>(); // per-chat message queues
 const abortedChats = new Set<string>(); // chat_ids that have been aborted
+const abortedTasks = new Set<string>(); // msg_ids of aborted scheduled tasks
 const currentQueryIters = new Map<string, AsyncIterator<unknown>>(); // per-chat query iterators
 let extensionMcpServers: Record<string, { type: string; command?: string; args?: string[]; url?: string; env?: Record<string, string>; headers?: Record<string, string> }> = {};
 
@@ -586,15 +587,12 @@ async function executeTask(data: Record<string, unknown>): Promise<void> {
       }
     }
 
-    // Scheduled tasks don't support per-chat abort; check if query was removed from activeQueries.
-    const wasAborted = msgId ? !activeQueries.has(msgId) : false;
-    if (fullResponse && !wasAborted) {
+    if (fullResponse && !(msgId && abortedTasks.has(msgId))) {
       await bridge.publishResult(fullResponse, msgId);
     }
     console.log(`[task] completed`);
   } catch (err) {
-    const wasAborted = msgId ? !activeQueries.has(msgId) : false;
-    if (wasAborted) {
+    if (msgId && abortedTasks.has(msgId)) {
       console.log("[task] aborted");
       return;
     }
@@ -602,7 +600,10 @@ async function executeTask(data: Record<string, unknown>): Promise<void> {
     console.error(`[task] error:`, err);
     await bridge.publishResult(`Error: ${errorMsg}`, msgId);
   } finally {
-    if (msgId) activeQueries.delete(msgId);
+    if (msgId) {
+      activeQueries.delete(msgId);
+      abortedTasks.delete(msgId);
+    }
     activeTaskCount--;
     // Dequeue next pending task
     if (pendingTasks.length > 0) {
@@ -955,7 +956,10 @@ async function handleControl(
         for (const [, iter] of currentQueryIters) iter.return?.(undefined);
         currentQueryIters.clear();
         // Abort all parallel task queries
-        for (const [, iter] of activeQueries) iter.return?.(undefined);
+        for (const [mid, iter] of activeQueries) {
+          abortedTasks.add(mid);
+          iter.return?.(undefined);
+        }
         activeQueries.clear();
         activeTaskCount = 0;
         pendingByChat.clear();

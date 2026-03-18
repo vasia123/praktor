@@ -484,7 +484,8 @@ func (b *Bot) handleMessage(ctx context.Context, msg telego.Message) {
 		volumePath := fmt.Sprintf("uploads/%d_%s", time.Now().Unix(), attachment.Name)
 		containerPath := "/workspace/agent/" + volumePath
 
-		if err := b.orch.WriteVolumeBytes(ctx, ag.Workspace, volumePath, data, image); err != nil {
+		workspace := "user-" + senderID
+		if err := b.orch.WriteVolumeBytes(ctx, workspace, volumePath, data, image); err != nil {
 			slog.Error("file write to volume failed", "path", volumePath, "error", err)
 			_ = b.SendMessage(ctx, chatID, "Sorry, I couldn't save the file to the agent workspace.")
 			return

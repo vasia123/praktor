@@ -991,7 +991,6 @@ async function handleControl(
         for (const dir of [
           "/home/praktor/.claude/projects",
           "/home/praktor/.claude/sessions",
-          "/home/praktor/.claude/debug",
           "/home/praktor/.claude/todos",
         ]) {
           try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -1024,7 +1023,7 @@ async function main(): Promise<void> {
   extensionMcpServers = extResult.mcpServers;
 
   // Clean up Claude Code internal files that accumulate over time
-  for (const dir of ["/home/praktor/.claude/debug", "/home/praktor/.claude/todos"]) {
+  for (const dir of ["/home/praktor/.claude/todos"]) {
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
   }
 
